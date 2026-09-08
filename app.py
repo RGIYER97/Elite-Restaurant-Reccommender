@@ -238,11 +238,12 @@ def render_collection_manager(result: SearchResult) -> tuple[str, frozenset[str]
         if selected_name not in collections:
             selected_name = "Favorites"
             st.session_state["active_collection"] = selected_name
+        elif "active_collection" not in st.session_state:
+            st.session_state["active_collection"] = selected_name
         with active_column:
             active = st.selectbox(
                 "Active collection",
                 names,
-                index=names.index(selected_name),
                 key="active_collection",
             )
             only_saved = st.checkbox(
@@ -550,6 +551,7 @@ def main() -> None:
     if shared_notice:
         st.info(shared_notice)
 
+    st.session_state.setdefault("location_input", "Manhattan, NYC")
     with st.form("location_search", clear_on_submit=False):
         input_column, scope_column, button_column = st.columns(
             (4, 2, 1),
@@ -558,7 +560,6 @@ def main() -> None:
         with input_column:
             location = st.text_input(
                 "City, neighborhood, or ZIP/postal code",
-                value="Manhattan, NYC",
                 max_chars=180,
                 placeholder="e.g. Williamsburg, Brooklyn",
                 key="location_input",
