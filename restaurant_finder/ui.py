@@ -165,7 +165,7 @@ def render_intro() -> None:
         <div class="intro-grid">
           <div class="intro-step"><small>01 / PICK A PLACE</small><h3>Your corner of the world.</h3><p>Start with a city, neighborhood, or postal code. We resolve and visibly bound the search area.</p></div>
           <div class="intro-step"><small>02 / SET A HIGH BAR</small><h3>Only the standouts.</h3><p>Every result clears both immutable standards: a 4.7 rating and at least 200 reviews.</p></div>
-          <div class="intro-step"><small>03 / ORDER WELL</small><h3>Know what to try.</h3><p>Review favorites appear only after they are verified against an accessible online menu.</p></div>
+          <div class="intro-step"><small>03 / ORDER WELL</small><h3>Know what to try.</h3><p>When requested, review favorites appear only after they are verified against an accessible online menu.</p></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -208,12 +208,14 @@ def render_summary(result: SearchResult) -> None:
         if result.search_area.is_walkable
         else f"{radius_miles:.1f} mi / {radius_km:.1f} km radius"
     )
+    details_count = sum(place.insights_loaded for place in result.places)
+    cold_cache_calls = 1 + result.page_count + details_count
     st.markdown(
         f"""
         <div class="result-summary">
           <div><span class="eyebrow">YOUR NEXT GOOD EVENING</span>
             <h2>The shortlist in {escape(result.search_area.name)}</h2>
-            <p>{scope_description} · {result.scanned_count:,} candidates · {result.page_count} pages · Updated {result.fetched_at.strftime('%b %d, %H:%M UTC')}</p>
+            <p>{scope_description} · {result.scanned_count:,} candidates · {result.page_count} pages · {cold_cache_calls} provider calls on a cold cache · Updated {result.fetched_at.strftime('%b %d, %H:%M UTC')}</p>
           </div>
           <span class="result-count" title="{len(result.places)} exceptional {noun}">{len(result.places):02d}</span>
         </div>
@@ -338,6 +340,10 @@ def render_place_card(place: Place, rank: int) -> None:
         dish_section = (
             '<div class="dish-label">Menu-verified picks</div>'
             f'<div class="dish-list">{chips}</div>'
+        )
+    elif not place.insights_loaded:
+        dish_section = (
+            '<div class="evidence">Menu picks were not loaded in cost-saving mode.</div>'
         )
     elif place.insights_error:
         dish_section = '<div class="evidence">Dish recommendations are temporarily unavailable.</div>'

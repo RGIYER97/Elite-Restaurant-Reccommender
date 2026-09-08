@@ -75,6 +75,7 @@ class Place:
     menu_uri: str | None = None
     menu_checked: bool = False
     dish_candidates_found: bool = False
+    insights_loaded: bool = False
     insights_error: str | None = None
 
     @property
@@ -119,6 +120,7 @@ class Place:
         menu_uri: str | None = None,
         menu_checked: bool = False,
         dish_candidates_found: bool = False,
+        insights_loaded: bool = True,
         insights_error: str | None = None,
     ) -> "Place":
         return replace(
@@ -131,6 +133,7 @@ class Place:
             menu_uri=menu_uri,
             menu_checked=menu_checked,
             dish_candidates_found=dish_candidates_found,
+            insights_loaded=insights_loaded,
             insights_error=insights_error,
         )
 

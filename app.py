@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 import hashlib
 from pathlib import Path
@@ -13,7 +14,8 @@ from streamlit_folium import st_folium
 from restaurant_finder.config import ConfigurationError, Settings
 from restaurant_finder.errors import GoogleMapsError
 from restaurant_finder.map_tiles import GoogleMapTilesClient, MapTileSession
-from restaurant_finder.models import SearchResult
+from restaurant_finder.models import Place, SearchResult
+from restaurant_finder.places_client import GooglePlacesClient
 from restaurant_finder.service import find_curated_places
 from restaurant_finder.ui import (
     build_map,
@@ -37,26 +39,77 @@ st.set_page_config(
     layout="wide",
 )
 
-# Keep only the latest distinct response. It remains cached across Streamlit
-# reruns until a different query evicts it, with a 30-day policy safety cap.
-@st.cache_data(show_spinner=False, max_entries=1, ttl=timedelta(days=30))
+# Reuse recent area sweeps across users and nearby navigation. The bounded cache
+# avoids another paid search for spelling/case variants and repeated locations.
+@st.cache_data(show_spinner=False, max_entries=64, ttl=timedelta(days=30))
 def cached_search(
     location: str,
     *,
     thorough: bool,
     credential_version: str,
+    geocoding_credential_version: str,
     _api_key: str,
+    _geocoding_api_key: str | None,
     max_pages: int | None,
 ) -> SearchResult:
-    # credential_version intentionally participates in Streamlit's cache key;
-    # _api_key does not, which keeps the full secret out of cache metadata.
-    del credential_version
+    # Fingerprints participate in the cache key while secrets prefixed with an
+    # underscore stay out of Streamlit's cache metadata.
+    del credential_version, geocoding_credential_version
     return find_curated_places(
         location,
         api_key=_api_key,
+        geocoding_api_key=_geocoding_api_key,
         max_pages=max_pages,
         thorough=thorough,
+        enrich=False,
     )
+
+
+# Details are cached by Place ID independently of area searches. Overlapping
+# neighborhoods therefore reuse the expensive review/menu enrichment request.
+@st.cache_data(show_spinner=False, max_entries=1_024, ttl=timedelta(days=30))
+def cached_place_insight(
+    place_id: str,
+    *,
+    credential_version: str,
+    _api_key: str,
+    _place: Place,
+) -> Place:
+    del credential_version
+    if _place.id != place_id:
+        raise ValueError("Place cache key does not match the requested place.")
+    return GooglePlacesClient(api_key=_api_key).enrich_place(_place)
+
+
+def add_cached_insights(result: SearchResult, *, api_key: str) -> SearchResult:
+    """Attach cached per-place details while leaving transient failures uncached."""
+
+    enriched = []
+    fingerprint = credential_fingerprint(api_key)
+    for place in result.places:
+        try:
+            cached = cached_place_insight(
+                place.id,
+                credential_version=fingerprint,
+                _api_key=api_key,
+                _place=place,
+            )
+        except GoogleMapsError as exc:
+            enriched.append(place.with_insights(insights_error=str(exc)))
+            continue
+        enriched.append(
+            place.with_insights(
+                recommended_dishes=cached.recommended_dishes,
+                known_for=cached.known_for,
+                reviews_uri=cached.reviews_uri,
+                summary_disclosure=cached.summary_disclosure,
+                summary_flag_uri=cached.summary_flag_uri,
+                menu_uri=cached.menu_uri,
+                menu_checked=cached.menu_checked,
+                dish_candidates_found=cached.dish_candidates_found,
+            )
+        )
+    return replace(result, places=tuple(enriched))
 
 
 # Map Tiles tokens currently last about two weeks. Cache for slightly less.
@@ -82,6 +135,12 @@ def credential_fingerprint(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
 
 
+def canonical_location(location: str) -> str:
+    """Collapse cosmetic input differences so equivalent searches share a cache key."""
+
+    return " ".join(location.split()).casefold()
+
+
 def load_settings() -> Settings | None:
     try:
         return Settings.from_env()
@@ -100,6 +159,13 @@ def render_results(result: SearchResult, settings: Settings) -> None:
     if not result.places:
         render_empty_state(has_candidates=True)
         return
+
+    if not any(place.insights_loaded for place in result.places):
+        st.info(
+            "Cost-saving mode is active: ratings and the map are complete, while paid dish "
+            "insights were skipped. Enable menu-verified picks and submit again to load them "
+            "without repeating this cached area search."
+        )
 
     filter_column, sort_column = st.columns((3, 2), gap="large")
     with filter_column:
@@ -205,6 +271,14 @@ def main() -> None:
                 "up to four times as many billable search requests."
             ),
         )
+        include_insights = st.checkbox(
+            "Include menu-verified dish and drink picks",
+            value=False,
+            help=(
+                "Adds one Place Details Enterprise + Atmosphere request for each venue that "
+                "passes the strict filters. Results are cached per venue for reuse across areas."
+            ),
+        )
 
     if submitted:
         st.session_state.pop("latest_result", None)
@@ -213,16 +287,28 @@ def main() -> None:
             st.error("Enter a city, neighborhood, or ZIP/postal code.")
         else:
             try:
-                with st.spinner(f"Sweeping restaurants and bars in {normalized_location}…"):
-                    # Session state keeps the result visible on widget reruns. The
-                    # one-entry data cache makes repeated identical calls free.
-                    st.session_state["latest_result"] = cached_search(
-                        normalized_location,
+                spinner_text = (
+                    f"Sweeping and verifying menus in {normalized_location}…"
+                    if include_insights
+                    else f"Sweeping restaurants and bars in {normalized_location}…"
+                )
+                with st.spinner(spinner_text):
+                    # Area searches and per-place details have separate caches,
+                    # so enabling insights later does not repeat the area sweep.
+                    result = cached_search(
+                        canonical_location(normalized_location),
                         thorough=thorough,
                         credential_version=credential_fingerprint(settings.places_api_key),
+                        geocoding_credential_version=credential_fingerprint(
+                            settings.geocoding_api_key or ""
+                        ),
                         _api_key=settings.places_api_key,
+                        _geocoding_api_key=settings.geocoding_api_key,
                         max_pages=settings.max_pages,
                     )
+                    if include_insights:
+                        result = add_cached_insights(result, api_key=settings.places_api_key)
+                    st.session_state["latest_result"] = result
                     st.session_state["place_kind"] = "All places"
                     st.session_state["place_order"] = "Highest rated"
             except (GoogleMapsError, ValueError) as exc:

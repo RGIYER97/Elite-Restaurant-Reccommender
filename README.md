@@ -9,10 +9,10 @@ returned page, deduplicates overlaps, and shows only establishments with:
 
 Results are ranked by rating and review count, displayed as matching cards and
 Folium map markers, and colored blue (4.7), purple (4.8), or gold (4.9–5.0).
-Qualified places are then enriched with Google review/place summaries and recent
-reviews to identify candidate dishes and what each venue is known for. Candidate
-dishes are displayed only when the same item is also found on an accessible HTML
-or PDF menu reached from the venue website supplied by Google Places.
+Users can optionally enrich qualified places with Google review/place summaries
+and recent reviews to identify candidate dishes and what each venue is known for.
+Candidate dishes are displayed only when the same item is also found on an
+accessible HTML or PDF menu reached from the venue website supplied by Google.
 
 ## Project layout
 
@@ -33,7 +33,8 @@ tests/                         Unit tests for filtering and pagination
 ## Google Cloud setup
 
 1. Create or select a Google Cloud project and attach a billing account.
-2. Enable **Places API (New)** and **Map Tiles API**.
+2. Enable **Places API (New)** and **Map Tiles API**. Optionally enable
+   **Geocoding API** to reduce the cost of location-resolution requests.
 3. Create API credentials. For local development, one key can serve both APIs.
    For production, use separate, appropriately restricted server and browser
    keys because Folium tile URLs are loaded by the browser.
@@ -45,6 +46,7 @@ cp .env.example .env
 
 ```dotenv
 GOOGLE_PLACES_API_KEY=your_server_key
+GOOGLE_GEOCODING_API_KEY=your_optional_geocoding_key
 GOOGLE_MAP_TILES_API_KEY=your_optional_tile_key
 ```
 
@@ -73,10 +75,12 @@ billable request on startup.
 
 ## Caching behavior
 
-`cached_search` uses Streamlit's data cache with `max_entries=1`: the newest
-distinct search replaces the prior cached API response. It also has a 30-day
-safety ceiling for Google Maps Platform caching rules. The latest result is kept
-in Streamlit session state so harmless UI reruns do not call Google again.
+Area searches use a shared, normalized Streamlit data cache with up to 64 recent
+queries and a 30-day ceiling. Case and whitespace variants share the same entry.
+Place Details enrichment has a separate 1,024-entry cache keyed by Place ID, so
+overlapping neighborhood searches reuse dish insights instead of buying them
+again. The latest result is also kept in session state, so harmless UI reruns do
+not call Google.
 
 The Map Tiles session is cached for 13 days, just under Google's current
 approximately two-week token lifetime. No results are written to disk.
@@ -87,6 +91,25 @@ To force a fresh API call during development, use Streamlit's app menu and selec
 ```bash
 streamlit cache clear
 ```
+
+## Cost controls
+
+- Menu-verified dish and drink picks are opt-in. A normal search skips Place
+  Details Enterprise + Atmosphere requests; enabling picks adds at most one such
+  request per strictly qualified venue, with results cached independently.
+- **Thorough coverage** remains off by default because it can issue four times as
+  many paginated restaurant/bar searches. Use it only when ordinary coverage is
+  insufficient in a dense or large area.
+- Set `PLACES_API_MAX_PAGES` to a positive number for a hard per-category page
+  ceiling. Keep `0` only when exhaustive pagination is more important than a
+  predictable ceiling.
+- Supplying `GOOGLE_GEOCODING_API_KEY` switches location resolution from Places
+  Text Search Pro to the less expensive Geocoding Essentials SKU. Use a key
+  restricted to Geocoding API; if omitted, the app keeps the existing Places-only
+  behavior.
+- Configure daily API quotas and a Cloud Billing budget alert in Google Cloud.
+  Budget alerts notify you but do not automatically cap spending; API quotas are
+  the hard guardrail.
 
 ## Tests
 
@@ -111,9 +134,10 @@ pytest -q
   a tighter walk time; the UI labels and draws the effective boundary.
 - Google only accepts `minRating` in 0.5 increments. The API query uses 4.5 to
   reduce noise, and the exact `rating >= 4.7` rule is enforced locally.
-- Place Details requests are made only for establishments that already pass the
-  rating, review-count, viewport, and radius filters. Candidate dishes are extracted
-  only from explicit recommendation/menu cues in Google's review-derived content.
+- When menu picks are enabled, Place Details requests are made only for
+  establishments that already pass the rating, review-count, viewport, and radius
+  filters. Candidate dishes are extracted only from explicit recommendation/menu
+  cues in Google's review-derived content.
   The venue website returned by Place Details is then checked for linked HTML and
   PDF menus; only exact or same-line normalized menu matches become dish chips.
   If a menu is inaccessible, dynamically rendered, or has no match, the UI withholds

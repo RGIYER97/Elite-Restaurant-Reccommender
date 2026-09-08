@@ -28,6 +28,16 @@ class FakeSession:
         return self.responses.pop(0)
 
 
+class FakeGeocodingSession:
+    def __init__(self, response: FakeResponse) -> None:
+        self.response = response
+        self.calls: list[dict[str, Any]] = []
+
+    def get(self, *_args: Any, **kwargs: Any) -> FakeResponse:
+        self.calls.append(kwargs)
+        return self.response
+
+
 def raw_place(place_id: str) -> dict[str, Any]:
     return {
         "id": place_id,
@@ -134,3 +144,44 @@ def test_neighborhood_resolves_to_clipped_walkable_radius() -> None:
     assert area.radius_meters == 1_200
     assert area.low_latitude > 40.72
     assert area.high_longitude < -73.97
+
+
+def test_optional_geocoding_resolver_avoids_a_places_text_search() -> None:
+    response = FakeResponse(
+        {
+            "status": "OK",
+            "results": [
+                {
+                    "place_id": "flatiron",
+                    "formatted_address": "Flatiron District, New York, NY, USA",
+                    "types": ["neighborhood", "political"],
+                    "address_components": [
+                        {
+                            "long_name": "Flatiron District",
+                            "types": ["neighborhood", "political"],
+                        }
+                    ],
+                    "geometry": {
+                        "location": {"lat": 40.7411, "lng": -73.9897},
+                        "viewport": {
+                            "southwest": {"lat": 40.72, "lng": -74.01},
+                            "northeast": {"lat": 40.76, "lng": -73.97},
+                        },
+                    },
+                }
+            ],
+        }
+    )
+    session = FakeGeocodingSession(response)
+    client = GooglePlacesClient(
+        "places-key",
+        geocoding_api_key="geocoding-key",
+        session=session,  # type: ignore[arg-type]
+    )
+
+    area = client.resolve_location("Flatiron, NYC")
+
+    assert area.name == "Flatiron District"
+    assert area.is_walkable is True
+    assert area.radius_meters == 1_200
+    assert session.calls[0]["params"]["address"] == "Flatiron, NYC"

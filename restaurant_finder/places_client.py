@@ -9,7 +9,13 @@ from urllib.parse import quote
 
 import requests
 
-from .errors import GoogleMapsError, GoogleServiceError, InvalidLocationError
+from .errors import (
+    AuthenticationError,
+    GoogleMapsError,
+    GoogleServiceError,
+    InvalidLocationError,
+    RateLimitError,
+)
 from .http_utils import build_retrying_session, raise_for_google_error
 from .menu_verifier import MenuVerifier
 from .models import FetchResult, Place, SearchArea, distance_meters
@@ -18,6 +24,7 @@ from .recommendations import extract_recommended_dishes
 
 PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACE_DETAILS_URL = "https://places.googleapis.com/v1/places/{place_id}"
+GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 FIELD_MASK = ",".join(
     (
         "places.id",
@@ -84,11 +91,13 @@ class GooglePlacesClient:
         self,
         api_key: str,
         *,
+        geocoding_api_key: str | None = None,
         max_pages: int | None = None,
         timeout_seconds: float = 15,
         session: requests.Session | None = None,
     ) -> None:
         self.api_key = api_key
+        self.geocoding_api_key = geocoding_api_key
         self.max_pages = max_pages
         self.timeout_seconds = timeout_seconds
         self.session = session or build_retrying_session()
@@ -165,6 +174,11 @@ class GooglePlacesClient:
                 enriched.append(place.with_insights(insights_error=str(exc)))
         return tuple(enriched)
 
+    def enrich_place(self, place: Place) -> Place:
+        """Load paid review/menu insights for one already-qualified place."""
+
+        return self._enrich_place(place)
+
     def _enrich_place(self, place: Place) -> Place:
         headers = {
             "Content-Type": "application/json",
@@ -238,6 +252,9 @@ class GooglePlacesClient:
     def resolve_location(self, location: str) -> SearchArea:
         """Resolve a town/neighborhood/postal code before searching businesses."""
 
+        if self.geocoding_api_key:
+            return self._resolve_location_with_geocoding(location)
+
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": self.api_key,
@@ -274,6 +291,131 @@ class GooglePlacesClient:
                 "That location could not be resolved to a city, neighborhood, or postal code."
             )
         return self._area_from_candidate(geographic_candidates[0])
+
+    def _resolve_location_with_geocoding(self, location: str) -> SearchArea:
+        """Use the lower-priced Geocoding SKU when explicitly configured."""
+
+        try:
+            response = self.session.get(
+                GEOCODING_URL,
+                params={
+                    "address": location,
+                    "key": self.geocoding_api_key,
+                    "language": "en",
+                },
+                timeout=self.timeout_seconds,
+            )
+        except requests.Timeout as exc:
+            raise GoogleServiceError("Google Geocoding timed out while resolving the location.") from exc
+        except requests.RequestException as exc:
+            raise GoogleServiceError(
+                "Could not reach Google Geocoding while resolving the location."
+            ) from exc
+
+        raise_for_google_error(response, request_kind="location lookup")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise GoogleServiceError("Google returned an invalid location response.") from exc
+        if not isinstance(payload, dict):
+            raise GoogleServiceError("Google returned an invalid location response.")
+
+        status = str(payload.get("status") or "")
+        detail = str(payload.get("error_message") or "").strip()
+        if status == "ZERO_RESULTS":
+            raise InvalidLocationError(
+                "That location could not be resolved to a city, neighborhood, or postal code."
+            )
+        if status in {"REQUEST_DENIED", "OVER_DAILY_LIMIT"}:
+            suffix = f" Details: {detail[:300]}" if detail else ""
+            raise AuthenticationError(
+                "Google denied the Geocoding request. Check API enablement, key restrictions, "
+                f"and billing.{suffix}"
+            )
+        if status == "OVER_QUERY_LIMIT":
+            raise RateLimitError("Google Geocoding quota was exceeded. Try again later.")
+        if status != "OK":
+            raise GoogleServiceError(
+                f"Google Geocoding could not resolve the location ({status or 'unknown error'})."
+            )
+
+        results = payload.get("results") or []
+        if not isinstance(results, list):
+            raise GoogleServiceError("Google returned an invalid location response.")
+        geographic_results = [
+            result
+            for result in results
+            if isinstance(result, dict)
+            and GEOGRAPHIC_TYPES.intersection(result.get("types") or [])
+        ]
+        if not geographic_results:
+            raise InvalidLocationError(
+                "That location could not be resolved to a city, neighborhood, or postal code."
+            )
+
+        result = geographic_results[0]
+        geometry = result.get("geometry") or {}
+        if not isinstance(geometry, dict):
+            raise InvalidLocationError("Google did not return a usable boundary for that location.")
+        center = geometry.get("location") or {}
+        boundary = geometry.get("bounds") or geometry.get("viewport") or {}
+        if not isinstance(center, dict) or not isinstance(boundary, dict):
+            raise InvalidLocationError("Google did not return a usable boundary for that location.")
+        southwest = boundary.get("southwest") or {}
+        northeast = boundary.get("northeast") or {}
+        if not isinstance(southwest, dict) or not isinstance(northeast, dict):
+            raise InvalidLocationError("Google did not return a usable boundary for that location.")
+        raw_types = result.get("types") or []
+        display_name = self._geocoding_display_name(result, raw_types)
+        return self._area_from_candidate(
+            {
+                "id": result.get("place_id"),
+                "displayName": {"text": display_name},
+                "formattedAddress": result.get("formatted_address"),
+                "types": raw_types,
+                "location": {
+                    "latitude": center.get("lat"),
+                    "longitude": center.get("lng"),
+                },
+                "viewport": {
+                    "low": {
+                        "latitude": southwest.get("lat"),
+                        "longitude": southwest.get("lng"),
+                    },
+                    "high": {
+                        "latitude": northeast.get("lat"),
+                        "longitude": northeast.get("lng"),
+                    },
+                },
+            }
+        )
+
+    @staticmethod
+    def _geocoding_display_name(result: dict[str, object], raw_types: object) -> str:
+        result_types = (
+            {value for value in raw_types if isinstance(value, str)}
+            if isinstance(raw_types, list)
+            else set()
+        )
+        priority_types = (
+            "neighborhood",
+            "postal_code",
+            "locality",
+            *sorted(SUBLOCALITY_TYPES),
+        )
+        components = result.get("address_components") or []
+        if isinstance(components, list):
+            for wanted_type in priority_types:
+                if wanted_type not in result_types:
+                    continue
+                for component in components:
+                    if not isinstance(component, dict):
+                        continue
+                    if wanted_type in (component.get("types") or []):
+                        name = str(component.get("long_name") or "").strip()
+                        if name:
+                            return name
+        return str(result.get("formatted_address") or "Search area").split(",", 1)[0]
 
     @staticmethod
     def _area_from_candidate(candidate: dict[str, object]) -> SearchArea:
