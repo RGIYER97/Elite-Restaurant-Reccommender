@@ -52,13 +52,14 @@ def find_curated_places(
     max_pages: int | None = None,
     thorough: bool = False,
     enrich: bool = True,
+    place_types: tuple[str, ...] = ("restaurant", "bar"),
 ) -> SearchResult:
     client = GooglePlacesClient(
         api_key=api_key,
         geocoding_api_key=geocoding_api_key,
         max_pages=max_pages,
     )
-    fetched = client.search_location(location, thorough=thorough)
+    fetched = client.search_location(location, place_types=place_types, thorough=thorough)
     curated = curate_places(fetched.places, search_area=fetched.search_area)
     return SearchResult.create(
         location=" ".join(location.split()),
@@ -68,4 +69,5 @@ def find_curated_places(
         search_area=fetched.search_area,
         warnings=fetched.warnings,
         thorough=thorough,
+        place_types=place_types,
     )

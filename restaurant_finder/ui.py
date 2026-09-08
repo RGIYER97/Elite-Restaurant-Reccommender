@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from html import escape
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import folium
 import streamlit as st
@@ -77,6 +77,9 @@ APP_CSS = """
     .place-meta { color:#64748b; font-size:.83rem; margin-top:.42rem; }
     .place-address { color:#334155; font-size:.88rem; line-height:1.35; margin-top:.62rem; }
     .place-link { color:#315d47 !important; font-size:.8rem; font-weight:750; text-decoration:none; }
+    .place-actions { display:flex; flex-wrap:wrap; gap:.45rem 1rem; margin-top:.75rem; }
+    .open-now { color:#28724c; font-weight:800; }
+    .closed-now { color:#9b3d32; font-weight:800; }
     .known-for { color:#475569; font-size:.84rem; line-height:1.4; margin-top:.72rem; }
     .dish-label {
         color:#64748b; font-size:.7rem; font-weight:850; letter-spacing:.08em;
@@ -132,8 +135,10 @@ def safe_url(value: str | None) -> str:
         return ""
     try:
         parsed = urlsplit(value)
-        if parsed.scheme == "https" and parsed.hostname and not parsed.username:
-            return value
+        if parsed.scheme in {"http", "https"} and parsed.hostname and not parsed.username:
+            return urlunsplit(
+                ("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment)
+            )
     except (TypeError, ValueError):
         pass
     return ""
@@ -283,11 +288,19 @@ def build_map(
         dishes = ""
         if place.recommended_dishes:
             dishes = f"<br><strong>Try:</strong> {escape(', '.join(place.recommended_dishes))}"
+        open_now = place.is_open_now()
+        hours = (
+            "<br><strong>Open now</strong>"
+            if open_now is True
+            else "<br><strong>Closed now</strong>"
+            if open_now is False
+            else ""
+        )
         popup = folium.Popup(
             (
                 f"<strong>{escape(place.name)}</strong><br>"
                 f"{place.rating:.1f} ★ · {place.review_count:,} reviews<br>"
-                f"{escape(place.address)}{dishes}{maps_link}"
+                f"{escape(place.address)}{hours}{dishes}{maps_link}"
             ),
             max_width=300,
         )
@@ -318,14 +331,39 @@ def build_map(
 
 
 def render_place_card(place: Place, rank: int) -> None:
-    maps_link = ""
+    action_links: list[str] = []
     maps_url = safe_url(place.google_maps_uri)
     if maps_url:
-        maps_link = (
-            f'<div style="margin-top:.7rem"><a class="place-link" '
+        action_links.append(
+            f'<a class="place-link" '
             f'href="{escape(maps_url, quote=True)}" target="_blank" '
-            'rel="noopener noreferrer">View on Google Maps ↗</a></div>'
+            'rel="noopener noreferrer">Google Maps ↗</a>'
         )
+    directions_url = safe_url(place.directions_uri)
+    if directions_url:
+        action_links.append(
+            f'<a class="place-link" href="{escape(directions_url, quote=True)}" '
+            'target="_blank" rel="noopener noreferrer">Directions ↗</a>'
+        )
+    website_url = safe_url(place.website_uri)
+    if website_url:
+        action_links.append(
+            f'<a class="place-link" href="{escape(website_url, quote=True)}" '
+            'target="_blank" rel="noopener noreferrer">Official site · reserve/order ↗</a>'
+        )
+    actions = (
+        f'<div class="place-actions">{"".join(action_links)}</div>'
+        if action_links
+        else ""
+    )
+
+    open_now = place.is_open_now()
+    if open_now is True:
+        opening_status = '<span class="open-now">Open now</span>'
+    elif open_now is False:
+        opening_status = '<span class="closed-now">Closed now</span>'
+    else:
+        opening_status = "Hours unavailable"
 
     known_for = ""
     if place.known_for:
@@ -396,13 +434,13 @@ def render_place_card(place: Place, rank: int) -> None:
           </div>
           <div class="place-meta">
             {escape(place.category_label)} · {escape(place.primary_type_label)} ·
-            {escape(place.price_label)} · {place.review_count:,} reviews
+            {escape(place.price_label)} · {place.review_count:,} reviews · {opening_status}
           </div>
           <div class="place-address">{escape(place.address)}</div>
           {known_for}
           {dish_section}
           {evidence}
-          {maps_link}
+          {actions}
         </article>
         """,
         unsafe_allow_html=True,

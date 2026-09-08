@@ -14,6 +14,20 @@ and recent reviews to identify candidate dishes and what each venue is known for
 Candidate dishes are displayed only when the same item is also found on an
 accessible HTML or PDF menu reached from the venue website supplied by Google.
 
+## Features
+
+- Search restaurants, bars, or both before any paid business lookup is made.
+- Filter the fetched shortlist locally by type, rating, review count, cuisine,
+  price, open-now status, or a selected local date and time.
+- Save places into named session collections and put an encoded collection into
+  the browser URL for sharing. Opening a shared URL prefills the search but never
+  triggers a paid request until the recipient submits it.
+- Build a dinner-to-drinks pairing from qualifying venues and open walking
+  directions through a free Google Maps URL.
+- Open the authoritative venue website for reservation/ordering options, or use
+  direct Google Maps place and directions links.
+- Opt into menu-verified review recommendations only when wanted.
+
 ## Project layout
 
 ```text
@@ -24,6 +38,9 @@ restaurant_finder/
   menu_verifier.py             Official-site menu discovery and dish verification
   map_tiles.py                 Google Map Tiles session handling
   service.py                   Filtering, deduplication, and ranking
+  filters.py                   Local, zero-request result refinements
+  itinerary.py                 Dinner/drinks pairing and Maps URL creation
+  sharing.py                   Validated shareable collection tokens
   recommendations.py           Evidence-based dish phrase extraction
   models.py                    Typed models and rating colors
   ui.py                        Folium map and Streamlit card rendering
@@ -70,7 +87,7 @@ python run.py
 ```
 
 Open the local URL printed by Streamlit. The input defaults to `Manhattan, NYC`.
-Searches begin only when **Find the best** is pressed, which avoids an unintended
+Searches begin only when **Find my shortlist** is pressed, which avoids an unintended
 billable request on startup.
 
 ## Caching behavior
@@ -110,6 +127,8 @@ streamlit cache clear
 - Configure daily API quotas and a Cloud Billing budget alert in Google Cloud.
   Budget alerts notify you but do not automatically cap spending; API quotas are
   the hard guardrail.
+- Choosing **Restaurants only** or **Bars only** skips the other category sweep,
+  reducing the ordinary two-category search request count.
 
 ## Tests
 
@@ -153,6 +172,16 @@ pytest -q
   up to four times as many billable search requests. Overlaps are deduplicated.
 - Category filters and rating/review/name sorting operate only on the active
   result set and never issue another paid API call.
+- Opening hours, authoritative websites, and Google Maps action links are fetched
+  in the existing Text Search response. Because rating and review-count fields
+  already require the Enterprise tier, these additions do not raise its highest
+  Text Search SKU.
+- Open-now and selected-time filters are calculated locally from the venue's
+  regular weekly hours and IANA time zone. They do not trigger follow-up requests;
+  holiday hours and exceptional closures can differ from the displayed status.
+- Personal collections live in Streamlit session state. A share token preserves
+  the selected Place IDs, search location, and category scope without exposing API
+  credentials or automatically issuing a recipient-side search.
 - Menu verification is a point-in-time check of public online pages. Menus can
   change, and some JavaScript-only or image-only menus cannot be verified.
 - Google Places content may not be shown with a non-Google basemap. This project

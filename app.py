@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 import hashlib
 from pathlib import Path
 
@@ -13,10 +13,13 @@ from streamlit_folium import st_folium
 
 from restaurant_finder.config import ConfigurationError, Settings
 from restaurant_finder.errors import GoogleMapsError
+from restaurant_finder.filters import filter_places
+from restaurant_finder.itinerary import suggest_evening_plan
 from restaurant_finder.map_tiles import GoogleMapTilesClient, MapTileSession
 from restaurant_finder.models import Place, SearchResult
 from restaurant_finder.places_client import GooglePlacesClient
 from restaurant_finder.service import find_curated_places
+from restaurant_finder.sharing import SharedCollection, decode_collection, encode_collection
 from restaurant_finder.ui import (
     build_map,
     inject_styles,
@@ -27,6 +30,27 @@ from restaurant_finder.ui import (
     render_place_card,
     render_summary,
 )
+
+
+SEARCH_SCOPES = {
+    "Restaurants & bars": ("restaurant", "bar"),
+    "Restaurants only": ("restaurant",),
+    "Bars only": ("bar",),
+}
+PRICE_LABELS = {
+    "PRICE_LEVEL_INEXPENSIVE": "$",
+    "PRICE_LEVEL_MODERATE": "$$",
+    "PRICE_LEVEL_EXPENSIVE": "$$$",
+    "PRICE_LEVEL_VERY_EXPENSIVE": "$$$$",
+    "UNKNOWN": "Price unavailable",
+}
+GENERIC_PLACE_TYPES = {
+    "bar",
+    "establishment",
+    "food",
+    "point_of_interest",
+    "restaurant",
+}
 
 
 # Always load the .env next to this file. Streamlit is often launched from a
@@ -45,6 +69,7 @@ st.set_page_config(
 def cached_search(
     location: str,
     *,
+    place_types: tuple[str, ...],
     thorough: bool,
     credential_version: str,
     geocoding_credential_version: str,
@@ -62,6 +87,7 @@ def cached_search(
         max_pages=max_pages,
         thorough=thorough,
         enrich=False,
+        place_types=place_types,
     )
 
 
@@ -141,6 +167,285 @@ def canonical_location(location: str) -> str:
     return " ".join(location.split()).casefold()
 
 
+def scope_label(place_types: tuple[str, ...]) -> str:
+    return next(
+        (label for label, values in SEARCH_SCOPES.items() if values == place_types),
+        "Restaurants & bars",
+    )
+
+
+def collection_state() -> dict[str, list[str]]:
+    collections = st.session_state.setdefault("collections", {"Favorites": []})
+    if not isinstance(collections, dict):
+        collections = {"Favorites": []}
+        st.session_state["collections"] = collections
+    collections.setdefault("Favorites", [])
+    return collections
+
+
+def import_shared_collection() -> None:
+    token = st.query_params.get("share")
+    if not token or token == st.session_state.get("imported_share_token"):
+        return
+    st.session_state["imported_share_token"] = token
+    try:
+        shared = decode_collection(token)
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+
+    collections = collection_state()
+    imported_name = shared.name
+    suffix = 2
+    while (
+        imported_name in collections
+        and collections[imported_name] != list(shared.place_ids)
+    ):
+        imported_name = f"{shared.name[:27]} (shared {suffix})"
+        suffix += 1
+    collections[imported_name] = list(shared.place_ids)
+    st.session_state["active_collection"] = imported_name
+    st.session_state["only_active_collection"] = True
+    st.session_state["location_input"] = shared.location
+    st.session_state["search_scope"] = scope_label(shared.place_types)
+    st.session_state["shared_collection_notice"] = (
+        f'Imported “{imported_name}”. Submit the prefilled search to load its places.'
+    )
+
+
+def render_collection_manager(result: SearchResult) -> tuple[str, frozenset[str] | None]:
+    collections = collection_state()
+    with st.expander("Your collections & sharing", expanded=False):
+        create_column, active_column = st.columns((2, 2))
+        with create_column:
+            new_name = st.text_input(
+                "New collection",
+                max_chars=40,
+                placeholder="e.g. Client dinners",
+                key="new_collection_name",
+            )
+            if st.button("Create collection", use_container_width=True):
+                cleaned = " ".join(new_name.split())
+                if not cleaned:
+                    st.warning("Enter a collection name first.")
+                else:
+                    collections.setdefault(cleaned, [])
+                    st.session_state["active_collection"] = cleaned
+                    st.rerun()
+
+        names = tuple(collections)
+        selected_name = st.session_state.get("active_collection", "Favorites")
+        if selected_name not in collections:
+            selected_name = "Favorites"
+            st.session_state["active_collection"] = selected_name
+        with active_column:
+            active = st.selectbox(
+                "Active collection",
+                names,
+                index=names.index(selected_name),
+                key="active_collection",
+            )
+            only_saved = st.checkbox(
+                "Only show places in this collection",
+                value=False,
+                key="only_active_collection",
+            )
+
+        saved_ids = tuple(collections.get(active, []))
+        st.caption(f"{len(saved_ids)} saved places · Collections live in this browser session.")
+        share_column, clear_column = st.columns(2)
+        with share_column:
+            if st.button("Create share link", use_container_width=True):
+                token = encode_collection(
+                    SharedCollection(
+                        name=active,
+                        location=result.location,
+                        place_types=result.place_types,
+                        place_ids=saved_ids,
+                    )
+                )
+                st.query_params["share"] = token
+                st.session_state["last_share_token"] = (active, token)
+        with clear_column:
+            if st.button("Clear active collection", use_container_width=True):
+                collections[active] = []
+                st.rerun()
+
+        last_share = st.session_state.get("last_share_token")
+        if isinstance(last_share, tuple) and last_share[0] == active:
+            token = last_share[1]
+            st.success("The browser URL now contains the collection. Copy the address bar to share it.")
+            st.code(f"?share={token}", language=None)
+
+    return active, frozenset(saved_ids) if only_saved else None
+
+
+def render_filters(
+    result: SearchResult,
+    *,
+    saved_place_ids: frozenset[str] | None,
+) -> tuple[Place, ...]:
+    price_options = tuple(
+        value
+        for value in PRICE_LABELS
+        if value in {(place.price_level or "UNKNOWN") for place in result.places}
+    )
+    cuisine_options = tuple(
+        sorted(
+            {
+                venue_type
+                for place in result.places
+                for venue_type in (*place.types, place.primary_type)
+                if venue_type and venue_type not in GENERIC_PLACE_TYPES
+            }
+        )
+    )
+
+    with st.expander("Refine the shortlist", expanded=True):
+        kind_column, rating_column, reviews_column, sort_column = st.columns(4)
+        available_kinds = ["All places"]
+        if "restaurant" in result.place_types:
+            available_kinds.append("Restaurants")
+        if "bar" in result.place_types:
+            available_kinds.append("Bars")
+        with kind_column:
+            kind_label = st.selectbox("Type", available_kinds, key="place_kind")
+        with rating_column:
+            minimum_rating = st.select_slider(
+                "Minimum rating",
+                options=(4.7, 4.8, 4.9),
+                value=4.7,
+                key="minimum_rating",
+            )
+        with reviews_column:
+            maximum_reviews = max(place.review_count for place in result.places)
+            minimum_reviews = st.number_input(
+                "Minimum reviews",
+                min_value=200,
+                max_value=maximum_reviews,
+                value=200,
+                step=50,
+                key="minimum_reviews",
+            )
+        with sort_column:
+            order = st.selectbox(
+                "Sort by",
+                ("Highest rated", "Most reviewed", "Name"),
+                key="place_order",
+            )
+
+        cuisine_column, price_column, availability_column = st.columns(3)
+        with cuisine_column:
+            cuisines = st.multiselect(
+                "Cuisine / venue style",
+                cuisine_options,
+                format_func=lambda value: value.replace("_", " ").title(),
+                key="cuisine_filters",
+            )
+        with price_column:
+            prices = st.multiselect(
+                "Price",
+                price_options,
+                format_func=lambda value: PRICE_LABELS[value],
+                key="price_filters",
+            )
+        with availability_column:
+            availability_label = st.selectbox(
+                "Availability",
+                ("Any time", "Open now", "Open at selected time"),
+                key="availability_filter",
+            )
+
+        if availability_label == "Open at selected time":
+            date_column, time_column = st.columns(2)
+            with date_column:
+                selected_date = st.date_input("Date", value=date.today(), key="open_date")
+            with time_column:
+                selected_time = st.time_input("Local time", value=time(19, 0), key="open_time")
+            st.caption(
+                "Selected-time filtering uses the venue’s typical weekly hours; holidays and "
+                "one-off closures may differ."
+            )
+        else:
+            selected_date = date.today()
+            selected_time = time(19, 0)
+            if availability_label == "Open now":
+                st.caption(
+                    "Open-now filtering is calculated in each venue’s time zone from its "
+                    "typical weekly hours; holidays and one-off closures may differ."
+                )
+
+    kind = {
+        "All places": "all",
+        "Restaurants": "restaurant",
+        "Bars": "bar",
+    }[kind_label]
+    availability = {
+        "Any time": "any",
+        "Open now": "open_now",
+        "Open at selected time": "open_at",
+    }[availability_label]
+    open_at = datetime.combine(selected_date, selected_time)
+    visible = filter_places(
+        result.places,
+        kind=kind,
+        minimum_rating=float(minimum_rating),
+        minimum_reviews=int(minimum_reviews),
+        price_levels=frozenset(prices),
+        cuisines=frozenset(cuisines),
+        availability=availability,
+        open_at=open_at,
+        saved_place_ids=saved_place_ids,
+    )
+    if order == "Most reviewed":
+        return tuple(
+            sorted(visible, key=lambda place: (-place.review_count, -place.rating, place.name.casefold()))
+        )
+    if order == "Name":
+        return tuple(sorted(visible, key=lambda place: (place.name.casefold(), place.id)))
+    return tuple(sorted(visible, key=lambda place: (-place.rating, -place.review_count, place.name.casefold())))
+
+
+def render_evening_planner(places: tuple[Place, ...], active_collection: str) -> None:
+    restaurants = tuple(place for place in places if "restaurant" in place.matched_types)
+    bars = tuple(place for place in places if "bar" in place.matched_types)
+    if not restaurants or not bars:
+        return
+
+    with st.expander("Plan dinner + drinks", expanded=False):
+        dinner_by_id = {place.id: place for place in restaurants}
+        dinner_id = st.selectbox(
+            "Start with dinner at",
+            tuple(dinner_by_id),
+            format_func=lambda place_id: dinner_by_id[place_id].name,
+            key="itinerary_dinner",
+        )
+        plan = suggest_evening_plan(places, dinner_id=dinner_id)
+        if plan is None:
+            st.info("A distinct qualifying bar is needed to build this itinerary.")
+            return
+        walk_minutes = max(1, round(plan.straight_line_meters / 80))
+        st.markdown(
+            f"**Dinner:** {plan.dinner.name}  →  **Drinks:** {plan.drinks.name}  "
+            f"· about {walk_minutes} minutes apart as a straight-line estimate"
+        )
+        action_column, save_column = st.columns(2)
+        with action_column:
+            st.link_button(
+                "Open walking directions",
+                plan.walking_url,
+                use_container_width=True,
+            )
+        with save_column:
+            if st.button("Save both to active collection", use_container_width=True):
+                collections = collection_state()
+                existing = collections.setdefault(active_collection, [])
+                collections[active_collection] = list(
+                    dict.fromkeys((*existing, plan.dinner.id, plan.drinks.id))
+                )
+                st.rerun()
+
+
 def load_settings() -> Settings | None:
     try:
         return Settings.from_env()
@@ -167,36 +472,12 @@ def render_results(result: SearchResult, settings: Settings) -> None:
             "without repeating this cached area search."
         )
 
-    filter_column, sort_column = st.columns((3, 2), gap="large")
-    with filter_column:
-        kind = st.radio(
-            "Show places",
-            ("All places", "Restaurants", "Bars"),
-            horizontal=True,
-            key="place_kind",
-        )
-    with sort_column:
-        order = st.selectbox(
-            "Sort by",
-            ("Highest rated", "Most reviewed", "Name"),
-            key="place_order",
-        )
-
-    visible = tuple(
-        place
-        for place in result.places
-        if kind == "All places"
-        or ("restaurant" if kind == "Restaurants" else "bar") in place.matched_types
-    )
-    if order == "Most reviewed":
-        visible = tuple(
-            sorted(visible, key=lambda place: (-place.review_count, -place.rating, place.name.casefold()))
-        )
-    elif order == "Name":
-        visible = tuple(sorted(visible, key=lambda place: (place.name.casefold(), place.id)))
+    active_collection, saved_filter = render_collection_manager(result)
+    visible = render_filters(result, saved_place_ids=saved_filter)
+    render_evening_planner(result.places, active_collection)
 
     if not visible:
-        st.info("No places in this category made the shortlist. Select All places to see every match.")
+        st.info("No places match the active filters or collection. Broaden the refinements above.")
         return
 
     list_column, map_column = st.columns((5, 7), gap="large")
@@ -205,6 +486,23 @@ def render_results(result: SearchResult, settings: Settings) -> None:
         with st.container(height=680, border=False):
             for rank, place in enumerate(visible, start=1):
                 render_place_card(place, rank)
+                collections = collection_state()
+                saved = place.id in collections.get(active_collection, [])
+                button_label = (
+                    f"Remove from {active_collection}" if saved else f"Save to {active_collection}"
+                )
+                if st.button(
+                    button_label,
+                    key=f"collection::{active_collection}::{place.id}",
+                    use_container_width=True,
+                ):
+                    existing = collections.setdefault(active_collection, [])
+                    collections[active_collection] = (
+                        [place_id for place_id in existing if place_id != place.id]
+                        if saved
+                        else list(dict.fromkeys((*existing, place.id)))
+                    )
+                    st.rerun()
             st.markdown(
                 '<div class="google-attribution">Place data © Google Maps</div>',
                 unsafe_allow_html=True,
@@ -247,14 +545,29 @@ def main() -> None:
         st.code("cp .env.example .env\nstreamlit run app.py", language="bash")
         return
 
+    import_shared_collection()
+    shared_notice = st.session_state.pop("shared_collection_notice", None)
+    if shared_notice:
+        st.info(shared_notice)
+
     with st.form("location_search", clear_on_submit=False):
-        input_column, button_column = st.columns((5, 1), vertical_alignment="bottom")
+        input_column, scope_column, button_column = st.columns(
+            (4, 2, 1),
+            vertical_alignment="bottom",
+        )
         with input_column:
             location = st.text_input(
                 "City, neighborhood, or ZIP/postal code",
                 value="Manhattan, NYC",
                 max_chars=180,
                 placeholder="e.g. Williamsburg, Brooklyn",
+                key="location_input",
+            )
+        with scope_column:
+            scope = st.selectbox(
+                "Looking for",
+                tuple(SEARCH_SCOPES),
+                key="search_scope",
             )
         with button_column:
             submitted = st.form_submit_button(
@@ -297,6 +610,7 @@ def main() -> None:
                     # so enabling insights later does not repeat the area sweep.
                     result = cached_search(
                         canonical_location(normalized_location),
+                        place_types=SEARCH_SCOPES[scope],
                         thorough=thorough,
                         credential_version=credential_fingerprint(settings.places_api_key),
                         geocoding_credential_version=credential_fingerprint(
@@ -308,9 +622,20 @@ def main() -> None:
                     )
                     if include_insights:
                         result = add_cached_insights(result, api_key=settings.places_api_key)
-                    st.session_state["latest_result"] = result
-                    st.session_state["place_kind"] = "All places"
-                    st.session_state["place_order"] = "Highest rated"
+                    st.session_state["latest_result"] = replace(
+                        result,
+                        location=normalized_location,
+                    )
+                    for widget_key in (
+                        "place_kind",
+                        "place_order",
+                        "minimum_rating",
+                        "minimum_reviews",
+                        "cuisine_filters",
+                        "price_filters",
+                        "availability_filter",
+                    ):
+                        st.session_state.pop(widget_key, None)
             except (GoogleMapsError, ValueError) as exc:
                 st.error(str(exc))
 

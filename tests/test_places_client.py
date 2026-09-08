@@ -47,6 +47,23 @@ def raw_place(place_id: str) -> dict[str, Any]:
         "rating": 4.8,
         "userRatingCount": 400,
         "primaryType": "restaurant",
+        "types": ["italian_restaurant", "restaurant"],
+        "websiteUri": "https://example.com",
+        "googleMapsLinks": {
+            "placeUri": "https://maps.google.com/place",
+            "directionsUri": "https://maps.google.com/directions",
+            "reviewsUri": "https://maps.google.com/reviews",
+        },
+        "currentOpeningHours": {"openNow": True},
+        "timeZone": {"id": "America/New_York"},
+        "regularOpeningHours": {
+            "periods": [
+                {
+                    "open": {"day": 1, "hour": 9, "minute": 30},
+                    "close": {"day": 1, "hour": 22, "minute": 0},
+                }
+            ]
+        },
     }
 
 
@@ -97,6 +114,28 @@ def test_client_follows_pagination_for_each_type() -> None:
     assert fake_session.calls[2]["json"]["pageToken"] == "next"
     assert fake_session.calls[1]["json"]["strictTypeFiltering"] is True
     assert "locationRestriction" in fake_session.calls[1]["json"]
+    assert result.places[0].website_uri == "https://example.com"
+    assert result.places[0].types == ("italian_restaurant", "restaurant")
+    assert result.places[0].directions_uri == "https://maps.google.com/directions"
+    assert result.places[0].open_now is True
+    assert result.places[0].time_zone == "America/New_York"
+    assert result.places[0].opening_periods[0].open_minute == 570
+
+
+def test_searching_one_category_avoids_the_other_category_request() -> None:
+    fake_session = FakeSession(
+        [
+            FakeResponse({"places": [raw_location()]}),
+            FakeResponse({"places": [raw_place("bar-1")]}),
+        ]
+    )
+    client = GooglePlacesClient("key", session=fake_session)  # type: ignore[arg-type]
+
+    result = client.search_location("South Orange", ("bar",))
+
+    assert [place.id for place in result.places] == ["bar-1"]
+    assert len(fake_session.calls) == 2
+    assert fake_session.calls[1]["json"]["includedType"] == "bar"
 
 
 def test_client_turns_429_into_rate_limit_error() -> None:

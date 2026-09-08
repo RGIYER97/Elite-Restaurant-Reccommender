@@ -34,8 +34,14 @@ FIELD_MASK = ",".join(
         "places.rating",
         "places.userRatingCount",
         "places.primaryType",
+        "places.types",
         "places.priceLevel",
         "places.googleMapsUri",
+        "places.googleMapsLinks",
+        "places.websiteUri",
+        "places.currentOpeningHours",
+        "places.regularOpeningHours",
+        "places.timeZone",
         "places.businessStatus",
         "nextPageToken",
     )
@@ -235,7 +241,7 @@ class GooglePlacesClient:
         return place.with_insights(
             recommended_dishes=menu_verification.dishes,
             known_for=known_for or None,
-            reviews_uri=review_summary_data.get("reviewsUri"),
+            reviews_uri=review_summary_data.get("reviewsUri") or place.reviews_uri,
             summary_disclosure=disclosure or None,
             summary_flag_uri=summary_source.get("flagContentUri"),
             menu_uri=menu_verification.menu_url,

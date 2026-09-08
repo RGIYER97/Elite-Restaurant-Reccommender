@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from math import asin, cos, isfinite, radians, sin, sqrt
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 RATING_COLORS = {
@@ -54,6 +55,27 @@ def rating_band(rating: float) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class OpeningPeriod:
+    """One recurring weekly opening interval using Google's Sunday=0 convention."""
+
+    open_day: int
+    open_minute: int
+    close_day: int | None = None
+    close_minute: int | None = None
+
+    def contains(self, day: int, minute: int) -> bool:
+        if self.close_day is None or self.close_minute is None:
+            return True
+        week_minutes = 7 * 24 * 60
+        start = self.open_day * 24 * 60 + self.open_minute
+        end = self.close_day * 24 * 60 + self.close_minute
+        if end <= start:
+            end += week_minutes
+        target = day * 24 * 60 + minute
+        return start <= target < end or start <= target + week_minutes < end
+
+
+@dataclass(frozen=True, slots=True)
 class Place:
     id: str
     name: str
@@ -66,6 +88,12 @@ class Place:
     price_level: str | None
     google_maps_uri: str | None
     matched_types: tuple[str, ...]
+    types: tuple[str, ...] = ()
+    website_uri: str | None = None
+    directions_uri: str | None = None
+    open_now: bool | None = None
+    opening_periods: tuple[OpeningPeriod, ...] = ()
+    time_zone: str | None = None
     is_closed: bool = False
     recommended_dishes: tuple[str, ...] = ()
     known_for: str | None = None
@@ -104,6 +132,32 @@ class Place:
             "PRICE_LEVEL_EXPENSIVE": "$$$",
             "PRICE_LEVEL_VERY_EXPENSIVE": "$$$$",
         }.get(self.price_level or "", "Price unavailable")
+
+    def is_open_at(self, when: datetime) -> bool | None:
+        """Evaluate typical local opening hours for a user-selected date/time."""
+
+        if not self.opening_periods:
+            return None
+        google_day = (when.weekday() + 1) % 7
+        minute = when.hour * 60 + when.minute
+        return any(period.contains(google_day, minute) for period in self.opening_periods)
+
+    def is_open_now(self, now: datetime | None = None) -> bool | None:
+        """Calculate current status dynamically so cached API flags never go stale."""
+
+        if self.opening_periods:
+            if now is None:
+                try:
+                    now = datetime.now(ZoneInfo(self.time_zone)) if self.time_zone else datetime.now()
+                except ZoneInfoNotFoundError:
+                    now = datetime.now()
+            elif self.time_zone and now.tzinfo is not None:
+                try:
+                    now = now.astimezone(ZoneInfo(self.time_zone))
+                except ZoneInfoNotFoundError:
+                    pass
+            return self.is_open_at(now)
+        return self.open_now
 
     def with_matched_type(self, place_type: str) -> "Place":
         types = tuple(sorted(set((*self.matched_types, place_type))))
@@ -150,6 +204,19 @@ class Place:
 
         display_name = payload.get("displayName") or {}
         name = str(display_name.get("text") or "Unnamed place").strip()
+        maps_links = payload.get("googleMapsLinks") or {}
+        if not isinstance(maps_links, dict):
+            maps_links = {}
+        current_hours = payload.get("currentOpeningHours") or {}
+        if not isinstance(current_hours, dict):
+            current_hours = {}
+        raw_time_zone = payload.get("timeZone")
+        if isinstance(raw_time_zone, dict):
+            time_zone = str(raw_time_zone.get("id") or "").strip() or None
+        elif isinstance(raw_time_zone, str):
+            time_zone = raw_time_zone.strip() or None
+        else:
+            time_zone = None
 
         try:
             parsed_latitude = float(latitude)
@@ -174,8 +241,23 @@ class Place:
                 review_count=parsed_reviews,
                 primary_type=str(payload.get("primaryType") or matched_type),
                 price_level=payload.get("priceLevel"),
-                google_maps_uri=payload.get("googleMapsUri"),
+                google_maps_uri=maps_links.get("placeUri") or payload.get("googleMapsUri"),
                 matched_types=(matched_type,),
+                types=tuple(
+                    value
+                    for value in payload.get("types", ())
+                    if isinstance(value, str) and value.strip()
+                ),
+                website_uri=payload.get("websiteUri"),
+                directions_uri=maps_links.get("directionsUri"),
+                reviews_uri=maps_links.get("reviewsUri"),
+                open_now=(
+                    bool(current_hours["openNow"])
+                    if isinstance(current_hours.get("openNow"), bool)
+                    else None
+                ),
+                opening_periods=cls._opening_periods(payload.get("regularOpeningHours")),
+                time_zone=time_zone,
                 is_closed=payload.get("businessStatus") in {
                     "CLOSED_PERMANENTLY",
                     "CLOSED_TEMPORARILY",
@@ -183,6 +265,45 @@ class Place:
             )
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _opening_periods(value: object) -> tuple[OpeningPeriod, ...]:
+        if not isinstance(value, dict) or not isinstance(value.get("periods"), list):
+            return ()
+        parsed: list[OpeningPeriod] = []
+        for period in value["periods"]:
+            if not isinstance(period, dict) or not isinstance(period.get("open"), dict):
+                continue
+            opens = period["open"]
+            closes = period.get("close")
+            try:
+                open_day = int(opens["day"])
+                open_minute = int(opens.get("hour", 0)) * 60 + int(opens.get("minute", 0))
+                close_day = int(closes["day"]) if isinstance(closes, dict) else None
+                close_minute = (
+                    int(closes.get("hour", 0)) * 60 + int(closes.get("minute", 0))
+                    if isinstance(closes, dict)
+                    else None
+                )
+                if not 0 <= open_day <= 6 or not 0 <= open_minute < 24 * 60:
+                    continue
+                if close_day is not None and (
+                    not 0 <= close_day <= 6
+                    or close_minute is None
+                    or not 0 <= close_minute < 24 * 60
+                ):
+                    continue
+                parsed.append(
+                    OpeningPeriod(
+                        open_day=open_day,
+                        open_minute=open_minute,
+                        close_day=close_day,
+                        close_minute=close_minute,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return tuple(parsed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +396,7 @@ class SearchResult:
     fetched_at: datetime
     warnings: tuple[str, ...] = ()
     thorough: bool = False
+    place_types: tuple[str, ...] = ("restaurant", "bar")
 
     @classmethod
     def create(
@@ -287,6 +409,7 @@ class SearchResult:
         search_area: SearchArea,
         warnings: tuple[str, ...] = (),
         thorough: bool = False,
+        place_types: tuple[str, ...] = ("restaurant", "bar"),
     ) -> "SearchResult":
         return cls(
             location=location,
@@ -297,4 +420,5 @@ class SearchResult:
             fetched_at=datetime.now(timezone.utc),
             warnings=warnings,
             thorough=thorough,
+            place_types=place_types,
         )
