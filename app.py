@@ -19,13 +19,7 @@ from restaurant_finder.filters import filter_places
 from restaurant_finder.itinerary import suggest_evening_plan
 from restaurant_finder.map_tiles import GoogleMapTilesClient, MapTileSession
 from restaurant_finder.models import Place, SearchResult
-from restaurant_finder.places_client import (
-    DEFAULT_SEARCH_RADIUS_MILES,
-    MAX_SEARCH_RADIUS_MILES,
-    METERS_PER_MILE,
-    MIN_SEARCH_RADIUS_MILES,
-    GooglePlacesClient,
-)
+from restaurant_finder.places_client import GooglePlacesClient
 from restaurant_finder.rate_limiter import RateLimiter, RateLimitRule
 from restaurant_finder.service import MIN_REVIEW_COUNT, find_curated_places
 from restaurant_finder.sharing import SharedCollection, decode_collection, encode_collection
@@ -73,6 +67,12 @@ INSIGHT_RATE_RULES = (
     RateLimitRule("insights-day", 3, 24 * 60 * 60),
 )
 MAX_INSIGHT_PLACES_PER_SEARCH = 10
+# Keep presentation defaults independent from the client module so a Streamlit
+# hot-reload cannot fail while replacing the client implementation.
+METERS_PER_MILE = 1_609.344
+DEFAULT_SEARCH_RADIUS_MILES = 3.0
+MIN_SEARCH_RADIUS_MILES = 0.25
+MAX_SEARCH_RADIUS_MILES = 25.0
 
 
 # Always load the .env next to this file. Streamlit is often launched from a
