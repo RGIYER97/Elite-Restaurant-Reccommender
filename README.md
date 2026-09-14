@@ -69,6 +69,22 @@ GOOGLE_MAP_TILES_API_KEY=your_optional_tile_key
 
 Never commit `.env`; it is already ignored.
 
+### Streamlit Community Cloud settings
+
+For a deployed app, open **Manage app → Settings → Secrets** and add the
+configuration as root-level TOML values alongside your Google key:
+
+```toml
+GOOGLE_PLACES_API_KEY = "your_server_key"
+GOOGLE_MAP_TILES_API_KEY = "your_optional_tile_key"
+PLACES_API_MAX_PAGES = 3
+```
+
+Use `PLACES_API_MAX_PAGES = 0` to follow every pagination token returned by
+Google. This can increase API usage and cost. Save the secrets and reboot the
+app for changes to take effect. Locally, use the equivalent `KEY=value` lines
+in the ignored `.env` file.
+
 ## Run locally
 
 Python 3.10 or newer is required.
