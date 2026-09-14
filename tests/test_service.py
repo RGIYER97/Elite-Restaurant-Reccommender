@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from restaurant_finder.models import Place, SearchArea, rating_color
 from restaurant_finder.service import curate_places
 
@@ -35,6 +37,27 @@ def test_curate_places_enforces_both_thresholds() -> None:
     )
 
     assert [place.id for place in curated] == ["qualified"]
+
+
+def test_curate_places_uses_custom_review_threshold() -> None:
+    places = (
+        make_place("established", 4.8, 750),
+        make_place("newer", 4.9, 125),
+    )
+
+    assert [place.id for place in curate_places(places, minimum_review_count=100)] == [
+        "newer",
+        "established",
+    ]
+    assert [place.id for place in curate_places(places, minimum_review_count=500)] == [
+        "established"
+    ]
+
+
+@pytest.mark.parametrize("invalid_threshold", [-1, 1.5, True])
+def test_curate_places_rejects_invalid_review_threshold(invalid_threshold: object) -> None:
+    with pytest.raises(ValueError, match="review count"):
+        curate_places((), minimum_review_count=invalid_threshold)  # type: ignore[arg-type]
 
 
 def test_curate_places_excludes_closed_venues() -> None:
@@ -113,3 +136,25 @@ def test_search_area_can_split_into_four_thorough_cells() -> None:
     assert cells[0]["high"] == {"latitude": 1, "longitude": 1}
     assert cells[-1]["low"] == {"latitude": 1, "longitude": 1}
     assert len(replace(area, is_walkable=True).search_rectangles(thorough=True)) == 4
+
+
+def test_search_area_can_be_recentered_on_a_manual_radius() -> None:
+    area = SearchArea(
+        name="Test Town",
+        formatted_address="Test Town",
+        center_latitude=40.75,
+        center_longitude=-74.25,
+        radius_meters=2_000,
+        low_latitude=40.74,
+        low_longitude=-74.26,
+        high_latitude=40.76,
+        high_longitude=-74.24,
+        is_walkable=True,
+    )
+
+    resized = area.with_radius(8_046.72)
+
+    assert resized.radius_meters == pytest.approx(8_046.72)
+    assert resized.low_latitude < area.low_latitude
+    assert resized.high_longitude > area.high_longitude
+    assert resized.is_walkable is False

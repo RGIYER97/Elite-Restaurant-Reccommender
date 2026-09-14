@@ -1,22 +1,22 @@
 # The Shortlist
 
 A Streamlit app that resolves an entered town/neighborhood/postal code, searches
-Google Places inside its geographic viewport and calculated radius, follows every
+Google Places inside a user-selected radius from that location, follows every
 returned page, deduplicates overlaps, and shows only establishments with:
 
 - a Google rating of **4.7 or higher**, and
-- **200 or more** Google user ratings.
+- at least the user-selected number of Google reviews (default: **200**).
 
 Results are ranked by rating and review count, displayed as matching cards and
 Folium map markers, and colored blue (4.7), purple (4.8), or gold (4.9–5.0).
-Users can optionally enrich qualified places with Google review/place summaries
-and recent reviews to identify candidate dishes and what each venue is known for.
-Candidate dishes are displayed only when the same item is also found on an
-accessible HTML or PDF menu reached from the venue website supplied by Google.
+Users can optionally enrich up to ten qualified places with Google review/place
+summaries describing what each venue is known for.
 
 ## Features
 
 - Search restaurants, bars, or both before any paid business lookup is made.
+- Set the qualifying review count and a 0.25–25 mile radius from the resolved
+  location center before searching.
 - Filter the fetched shortlist locally by type, rating, review count, cuisine,
   price, open-now status, or a selected local date and time.
 - Save places into named session collections and put an encoded collection into
@@ -26,7 +26,10 @@ accessible HTML or PDF menu reached from the venue website supplied by Google.
   directions through a free Google Maps URL.
 - Open the authoritative venue website for reservation/ordering options, or use
   direct Google Maps place and directions links.
-- Opt into menu-verified review recommendations only when wanted.
+- Opt into Google review summaries only when wanted.
+- Rate-limit repeated, thorough, and enriched searches per connection before a
+  cached or paid lookup is attempted.
+- Restrict all server-originated HTTP to Google Places and Google Map Tiles.
 
 ## Project layout
 
@@ -35,13 +38,12 @@ app.py                         Streamlit orchestration and one-result cache
 restaurant_finder/
   config.py                    Environment configuration
   places_client.py             Places API calls and pagination
-  menu_verifier.py             Official-site menu discovery and dish verification
   map_tiles.py                 Google Map Tiles session handling
+  rate_limiter.py              Process-wide sliding-window abuse limits
   service.py                   Filtering, deduplication, and ranking
   filters.py                   Local, zero-request result refinements
   itinerary.py                 Dinner/drinks pairing and Maps URL creation
   sharing.py                   Validated shareable collection tokens
-  recommendations.py           Evidence-based dish phrase extraction
   models.py                    Typed models and rating colors
   ui.py                        Folium map and Streamlit card rendering
 tests/                         Unit tests for filtering and pagination
@@ -50,8 +52,7 @@ tests/                         Unit tests for filtering and pagination
 ## Google Cloud setup
 
 1. Create or select a Google Cloud project and attach a billing account.
-2. Enable **Places API (New)** and **Map Tiles API**. Optionally enable
-   **Geocoding API** to reduce the cost of location-resolution requests.
+2. Enable **Places API (New)** and **Map Tiles API** only.
 3. Create API credentials. For local development, one key can serve both APIs.
    For production, use separate, appropriately restricted server and browser
    keys because Folium tile URLs are loaded by the browser.
@@ -63,7 +64,6 @@ cp .env.example .env
 
 ```dotenv
 GOOGLE_PLACES_API_KEY=your_server_key
-GOOGLE_GEOCODING_API_KEY=your_optional_geocoding_key
 GOOGLE_MAP_TILES_API_KEY=your_optional_tile_key
 ```
 
@@ -95,7 +95,7 @@ billable request on startup.
 Area searches use a shared, normalized Streamlit data cache with up to 64 recent
 queries and a 30-day ceiling. Case and whitespace variants share the same entry.
 Place Details enrichment has a separate 1,024-entry cache keyed by Place ID, so
-overlapping neighborhood searches reuse dish insights instead of buying them
+overlapping neighborhood searches reuse review insights instead of buying them
 again. The latest result is also kept in session state, so harmless UI reruns do
 not call Google.
 
@@ -111,19 +111,18 @@ streamlit cache clear
 
 ## Cost controls
 
-- Menu-verified dish and drink picks are opt-in. A normal search skips Place
-  Details Enterprise + Atmosphere requests; enabling picks adds at most one such
-  request per strictly qualified venue, with results cached independently.
+- Google review insights are opt-in. A normal search skips Place Details
+  Enterprise + Atmosphere requests; enabling insights adds at most ten such
+  requests per search, with results cached independently by Place ID.
+- Each connection is limited to 3 searches per minute and 20 per rolling day.
+  Thorough and insight-enabled searches are each limited to 1 per 10 minutes and
+  3 per rolling day. These lightweight counters are process-local, so production
+  deployments with multiple replicas should also enforce limits at the edge.
 - **Thorough coverage** remains off by default because it can issue four times as
   many paginated restaurant/bar searches. Use it only when ordinary coverage is
   insufficient in a dense or large area.
-- Set `PLACES_API_MAX_PAGES` to a positive number for a hard per-category page
-  ceiling. Keep `0` only when exhaustive pagination is more important than a
-  predictable ceiling.
-- Supplying `GOOGLE_GEOCODING_API_KEY` switches location resolution from Places
-  Text Search Pro to the less expensive Geocoding Essentials SKU. Use a key
-  restricted to Geocoding API; if omitted, the app keeps the existing Places-only
-  behavior.
+- The default per-category page ceiling is 2. Set `PLACES_API_MAX_PAGES=0` only
+  when exhaustive pagination is intentionally preferred over predictable spend.
 - Configure daily API quotas and a Cloud Billing budget alert in Google Cloud.
   Budget alerts notify you but do not automatically cap spending; API quotas are
   the hard guardrail.
@@ -142,31 +141,20 @@ pytest -q
 
 - Text Search permits one `includedType` per request, so restaurants and bars are
   swept separately with `strictTypeFiltering=true`, then deduplicated by Place ID.
-- Each input is first resolved to Google's geographic center and viewport. The
-  farthest viewport corner determines a logical radius (clamped to 1.5–25 km).
-  Business queries use the viewport as a hard API restriction, followed by an
-  exact Haversine radius check locally, so adjacent towns do not leak in.
-- Inputs Google classifies as a neighborhood—or as a sufficiently small
-  sublocality—switch to walkable mode. The search rectangle is clipped around
-  the center and results are capped at a 1.2 km straight-line radius, roughly a
-  maximum 15-minute walk at an ordinary pace. Smaller provider viewports produce
-  a tighter walk time; the UI labels and draws the effective boundary.
+- Each input is first resolved to Google's geographic center. The selected mile
+  radius becomes a rectangular API restriction around that center, followed by
+  an exact Haversine distance check locally. The UI labels and draws the same
+  effective circular boundary shown on the map.
 - Google only accepts `minRating` in 0.5 increments. The API query uses 4.5 to
   reduce noise, and the exact `rating >= 4.7` rule is enforced locally.
-- When menu picks are enabled, Place Details requests are made only for
-  establishments that already pass the rating, review-count, viewport, and radius
-  filters. Candidate dishes are extracted only from explicit recommendation/menu
-  cues in Google's review-derived content.
-  The venue website returned by Place Details is then checked for linked HTML and
-  PDF menus; only exact or same-line normalized menu matches become dish chips.
-  If a menu is inaccessible, dynamically rendered, or has no match, the UI withholds
-  the recommendation and explains why instead of implying certainty.
+- When review insights are enabled, Place Details requests are made only for the
+  first ten establishments that already pass the rating, review-count, viewport,
+  and radius filters. The server never fetches their websites or menu documents.
 - Review and place summaries use the Place Details Enterprise + Atmosphere SKU.
   The UI preserves Google's reviews link, Gemini disclosure, and reporting link.
-- With `PLACES_API_MAX_PAGES=0` (the default), every `nextPageToken` returned by
-  Google is followed. Set a positive value only if you intentionally want a cost
-  guard per place type.
-- The optional **Thorough coverage** control divides the resolved viewport into
+- With `PLACES_API_MAX_PAGES=2` (the default), each area/category sweep stops after
+  two pages. Setting it to `0` follows every `nextPageToken` returned by Google.
+- The optional **Thorough coverage** control divides the selected search area into
   four cells and searches both types in every cell. It improves discovery in
   larger/dense areas where a single query hits Google's result cap, but can use
   up to four times as many billable search requests. Overlaps are deduplicated.
@@ -182,8 +170,9 @@ pytest -q
 - Personal collections live in Streamlit session state. A share token preserves
   the selected Place IDs, search location, and category scope without exposing API
   credentials or automatically issuing a recipient-side search.
-- Menu verification is a point-in-time check of public online pages. Menus can
-  change, and some JavaScript-only or image-only menus cannot be verified.
+- A hostname allowlist in the shared HTTP client blocks accidental server-side
+  calls outside `places.googleapis.com` and `tile.googleapis.com`. Google Maps,
+  directions, and official-site links are opened by the user's browser.
 - Google Places content may not be shown with a non-Google basemap. This project
   therefore uses official Google roadmap tiles inside Folium instead of Folium's
   default OpenStreetMap layer and includes Google Maps attribution.

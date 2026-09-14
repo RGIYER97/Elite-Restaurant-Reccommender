@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from restaurant_finder.errors import RateLimitError
-from restaurant_finder.places_client import GooglePlacesClient
+from restaurant_finder.places_client import METERS_PER_MILE, GooglePlacesClient
 
 
 class FakeResponse:
@@ -26,16 +26,6 @@ class FakeSession:
     def post(self, *_args: Any, **kwargs: Any) -> FakeResponse:
         self.calls.append(kwargs)
         return self.responses.pop(0)
-
-
-class FakeGeocodingSession:
-    def __init__(self, response: FakeResponse) -> None:
-        self.response = response
-        self.calls: list[dict[str, Any]] = []
-
-    def get(self, *_args: Any, **kwargs: Any) -> FakeResponse:
-        self.calls.append(kwargs)
-        return self.response
 
 
 def raw_place(place_id: str) -> dict[str, Any]:
@@ -185,42 +175,39 @@ def test_neighborhood_resolves_to_clipped_walkable_radius() -> None:
     assert area.high_longitude < -73.97
 
 
-def test_optional_geocoding_resolver_avoids_a_places_text_search() -> None:
-    response = FakeResponse(
-        {
-            "status": "OK",
-            "results": [
-                {
-                    "place_id": "flatiron",
-                    "formatted_address": "Flatiron District, New York, NY, USA",
-                    "types": ["neighborhood", "political"],
-                    "address_components": [
-                        {
-                            "long_name": "Flatiron District",
-                            "types": ["neighborhood", "political"],
-                        }
-                    ],
-                    "geometry": {
-                        "location": {"lat": 40.7411, "lng": -73.9897},
-                        "viewport": {
-                            "southwest": {"lat": 40.72, "lng": -74.01},
-                            "northeast": {"lat": 40.76, "lng": -73.97},
-                        },
-                    },
-                }
-            ],
-        }
+def test_manual_radius_replaces_provider_viewport_for_search_and_distance_filter() -> None:
+    fake_session = FakeSession(
+        [
+            FakeResponse({"places": [raw_location()]}),
+            FakeResponse({"places": []}),
+        ]
     )
-    session = FakeGeocodingSession(response)
-    client = GooglePlacesClient(
-        "places-key",
-        geocoding_api_key="geocoding-key",
-        session=session,  # type: ignore[arg-type]
+    client = GooglePlacesClient("key", session=fake_session)  # type: ignore[arg-type]
+
+    result = client.search_location(
+        "South Orange",
+        ("restaurant",),
+        radius_miles=3.0,
     )
 
-    area = client.resolve_location("Flatiron, NYC")
+    assert result.search_area.radius_meters == pytest.approx(3.0 * METERS_PER_MILE)
+    assert result.search_area.low_latitude < raw_location()["viewport"]["low"]["latitude"]
+    assert result.search_area.is_walkable is False
+    assert fake_session.calls[1]["json"]["locationRestriction"] == {
+        "rectangle": result.search_area.rectangle
+    }
 
-    assert area.name == "Flatiron District"
-    assert area.is_walkable is True
-    assert area.radius_meters == 1_200
-    assert session.calls[0]["params"]["address"] == "Flatiron, NYC"
+
+@pytest.mark.parametrize("invalid_radius", [0.0, 0.1, 25.1, float("inf"), True])
+def test_manual_radius_is_validated_before_location_lookup(invalid_radius: object) -> None:
+    fake_session = FakeSession([])
+    client = GooglePlacesClient("key", session=fake_session)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Search radius"):
+        client.search_location(
+            "South Orange",
+            ("restaurant",),
+            radius_miles=invalid_radius,  # type: ignore[arg-type]
+        )
+
+    assert fake_session.calls == []

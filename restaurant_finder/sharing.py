@@ -10,6 +10,10 @@ import json
 
 MAX_SHARED_PLACES = 50
 MAX_TOKEN_LENGTH = 8_000
+DEFAULT_MINIMUM_REVIEW_COUNT = 200
+DEFAULT_RADIUS_MILES = 3.0
+MIN_RADIUS_MILES = 0.25
+MAX_RADIUS_MILES = 25.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +22,8 @@ class SharedCollection:
     location: str
     place_types: tuple[str, ...]
     place_ids: tuple[str, ...]
+    minimum_review_count: int = DEFAULT_MINIMUM_REVIEW_COUNT
+    radius_miles: float = DEFAULT_RADIUS_MILES
 
 
 def encode_collection(collection: SharedCollection) -> str:
@@ -27,6 +33,8 @@ def encode_collection(collection: SharedCollection) -> str:
         "l": collection.location[:180],
         "t": [value for value in collection.place_types if value in {"restaurant", "bar"}],
         "p": list(dict.fromkeys(collection.place_ids))[:MAX_SHARED_PLACES],
+        "m": collection.minimum_review_count,
+        "r": collection.radius_miles,
     }
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -63,9 +71,25 @@ def decode_collection(token: str) -> SharedCollection:
     )
     if not place_types:
         place_types = ("restaurant", "bar")
+    raw_minimum_reviews = payload.get("m", DEFAULT_MINIMUM_REVIEW_COUNT)
+    raw_radius_miles = payload.get("r", DEFAULT_RADIUS_MILES)
+    if (
+        isinstance(raw_minimum_reviews, bool)
+        or not isinstance(raw_minimum_reviews, int)
+        or raw_minimum_reviews < 0
+        or raw_minimum_reviews > 100_000
+    ):
+        raise ValueError("The shared collection has an invalid review threshold.")
+    if isinstance(raw_radius_miles, bool) or not isinstance(raw_radius_miles, (int, float)):
+        raise ValueError("The shared collection has an invalid search radius.")
+    radius_miles = float(raw_radius_miles)
+    if not MIN_RADIUS_MILES <= radius_miles <= MAX_RADIUS_MILES:
+        raise ValueError("The shared collection has an invalid search radius.")
     return SharedCollection(
         name=name or "Shared shortlist",
         location=location,
         place_types=place_types,
         place_ids=place_ids,
+        minimum_review_count=raw_minimum_reviews,
+        radius_miles=radius_miles,
     )

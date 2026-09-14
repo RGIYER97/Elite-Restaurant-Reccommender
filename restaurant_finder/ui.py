@@ -53,6 +53,59 @@ APP_CSS = """
         background:white; border:1px solid #d8ded5; border-radius:15px;
         box-shadow:0 8px 30px rgba(38,62,49,.04); padding:1.1rem 1.35rem;
     }
+    /* Keep every Streamlit action legible, regardless of the active theme. */
+    .stButton > button,
+    .stFormSubmitButton > button,
+    .stLinkButton > a,
+    [data-testid="stBaseButton-primary"],
+    [data-testid="stBaseButton-secondary"],
+    [data-testid="stBaseButton-primaryFormSubmit"],
+    [data-testid="stBaseButton-secondaryFormSubmit"] {
+        background:#1f4d3a !important; border:1px solid #16382a !important;
+        color:#ffffff !important; font-weight:700 !important;
+    }
+    .stButton > button *,
+    .stFormSubmitButton > button *,
+    .stLinkButton > a *,
+    [data-testid="stBaseButton-primary"] *,
+    [data-testid="stBaseButton-secondary"] *,
+    [data-testid="stBaseButton-primaryFormSubmit"] *,
+    [data-testid="stBaseButton-secondaryFormSubmit"] * { color:#ffffff !important; }
+    .stButton > button:hover:not(:disabled),
+    .stFormSubmitButton > button:hover:not(:disabled),
+    .stLinkButton > a:hover,
+    [data-testid="stBaseButton-primary"]:hover:not(:disabled),
+    [data-testid="stBaseButton-secondary"]:hover:not(:disabled),
+    [data-testid="stBaseButton-primaryFormSubmit"]:hover:not(:disabled),
+    [data-testid="stBaseButton-secondaryFormSubmit"]:hover:not(:disabled) {
+        background:#16382a !important; border-color:#0d241a !important;
+        color:#ffffff !important;
+    }
+    .stButton > button:focus-visible,
+    .stFormSubmitButton > button:focus-visible,
+    .stLinkButton > a:focus-visible,
+    [data-testid="stBaseButton-primary"]:focus-visible,
+    [data-testid="stBaseButton-secondary"]:focus-visible,
+    [data-testid="stBaseButton-primaryFormSubmit"]:focus-visible,
+    [data-testid="stBaseButton-secondaryFormSubmit"]:focus-visible {
+        box-shadow:0 0 0 3px #f7f5ef, 0 0 0 6px #1f4d3a !important;
+        outline:0 !important;
+    }
+    .stButton > button:disabled,
+    .stFormSubmitButton > button:disabled,
+    [data-testid="stBaseButton-primary"]:disabled,
+    [data-testid="stBaseButton-secondary"]:disabled,
+    [data-testid="stBaseButton-primaryFormSubmit"]:disabled,
+    [data-testid="stBaseButton-secondaryFormSubmit"]:disabled {
+        background:#dbe4dd !important; border-color:#aebdb2 !important;
+        color:#31443a !important; opacity:1 !important;
+    }
+    .stButton > button:disabled *,
+    .stFormSubmitButton > button:disabled *,
+    [data-testid="stBaseButton-primary"]:disabled *,
+    [data-testid="stBaseButton-secondary"]:disabled *,
+    [data-testid="stBaseButton-primaryFormSubmit"]:disabled *,
+    [data-testid="stBaseButton-secondaryFormSubmit"]:disabled * { color:#31443a !important; }
     .result-summary {
         align-items:flex-end; border-bottom:1px solid #d9ddd3; display:flex;
         gap:1rem; justify-content:space-between; margin:.6rem 0 1rem; padding:1rem 0;
@@ -157,7 +210,7 @@ def render_hero() -> None:
             <h1>Go somewhere<br><em>really good.</em></h1>
             <p class="hero-copy">A considered collection of standout tables and exceptional bars—bounded to your chosen area and backed by hundreds of reviews.</p>
           </div>
-          <div class="quality-seal"><small>The standard</small><b>4.7+</b><small>200+ reviews</small></div>
+          <div class="quality-seal"><small>The standard</small><b>4.7+</b><small>You set the reach</small></div>
         </section>
         """,
         unsafe_allow_html=True,
@@ -169,8 +222,8 @@ def render_intro() -> None:
         """
         <div class="intro-grid">
           <div class="intro-step"><small>01 / PICK A PLACE</small><h3>Your corner of the world.</h3><p>Start with a city, neighborhood, or postal code. We resolve and visibly bound the search area.</p></div>
-          <div class="intro-step"><small>02 / SET A HIGH BAR</small><h3>Only the standouts.</h3><p>Every result clears both immutable standards: a 4.7 rating and at least 200 reviews.</p></div>
-          <div class="intro-step"><small>03 / ORDER WELL</small><h3>Know what to try.</h3><p>When requested, review favorites appear only after they are verified against an accessible online menu.</p></div>
+          <div class="intro-step"><small>02 / SET A HIGH BAR</small><h3>Only the standouts.</h3><p>Choose the minimum review count and how many miles from the location to search; every result still clears a 4.7 rating.</p></div>
+          <div class="intro-step"><small>03 / CHOOSE WELL</small><h3>Know what stands out.</h3><p>When requested, Google review summaries add context without contacting third-party websites.</p></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -220,7 +273,7 @@ def render_summary(result: SearchResult) -> None:
         <div class="result-summary">
           <div><span class="eyebrow">YOUR NEXT GOOD EVENING</span>
             <h2>The shortlist in {escape(result.search_area.name)}</h2>
-            <p>{scope_description} · {result.scanned_count:,} candidates · {result.page_count} pages · {cold_cache_calls} provider calls on a cold cache · Updated {result.fetched_at.strftime('%b %d, %H:%M UTC')}</p>
+            <p>{scope_description} · ≥{result.minimum_review_count:,} reviews · {result.scanned_count:,} candidates · {result.page_count} pages · {cold_cache_calls} provider calls on a cold cache · Updated {result.fetched_at.strftime('%b %d, %H:%M UTC')}</p>
           </div>
           <span class="result-count" title="{len(result.places)} exceptional {noun}">{len(result.places):02d}</span>
         </div>
@@ -285,9 +338,6 @@ def build_map(
                 f'<br><a href="{escape(maps_url, quote=True)}" '
                 'target="_blank" rel="noopener noreferrer">Open in Google Maps</a>'
             )
-        dishes = ""
-        if place.recommended_dishes:
-            dishes = f"<br><strong>Try:</strong> {escape(', '.join(place.recommended_dishes))}"
         open_now = place.is_open_now()
         hours = (
             "<br><strong>Open now</strong>"
@@ -300,7 +350,7 @@ def build_map(
             (
                 f"<strong>{escape(place.name)}</strong><br>"
                 f"{place.rating:.1f} ★ · {place.review_count:,} reviews<br>"
-                f"{escape(place.address)}{hours}{dishes}{maps_link}"
+                f"{escape(place.address)}{hours}{maps_link}"
             ),
             max_width=300,
         )
@@ -369,42 +419,17 @@ def render_place_card(place: Place, rank: int) -> None:
     if place.known_for:
         known_for = f'<div class="known-for"><strong>Known for:</strong> {escape(place.known_for)}</div>'
 
-    dish_section = ""
-    if place.recommended_dishes:
-        chips = "".join(
-            f'<span class="dish-chip">{escape(dish)}</span>'
-            for dish in place.recommended_dishes
-        )
-        dish_section = (
-            '<div class="dish-label">Menu-verified picks</div>'
-            f'<div class="dish-list">{chips}</div>'
-        )
-    elif not place.insights_loaded:
-        dish_section = (
-            '<div class="evidence">Menu picks were not loaded in cost-saving mode.</div>'
+    insight_note = ""
+    if not place.insights_loaded:
+        insight_note = (
+            '<div class="evidence">Google review insights were not loaded in cost-saving mode.</div>'
         )
     elif place.insights_error:
-        dish_section = '<div class="evidence">Dish recommendations are temporarily unavailable.</div>'
-    elif place.dish_candidates_found and not place.menu_checked:
-        dish_section = (
-            '<div class="evidence">Review favorites were found, but no accessible online menu '
-            'was available to verify them.</div>'
-        )
-    elif place.dish_candidates_found:
-        dish_section = (
-            '<div class="evidence">Review favorites were found, but none could be verified on '
-            'the accessible menu.</div>'
-        )
-    else:
-        dish_section = '<div class="evidence">No clear dish consensus was found in available reviews.</div>'
+        insight_note = '<div class="evidence">Google review insights are temporarily unavailable.</div>'
+    elif not place.known_for:
+        insight_note = '<div class="evidence">No Google review summary is available.</div>'
 
     evidence_links: list[str] = []
-    menu_url = safe_url(place.menu_uri)
-    if menu_url:
-        evidence_links.append(
-            f'<a href="{escape(menu_url, quote=True)}" target="_blank" '
-            'rel="noopener noreferrer">Menu source ↗</a>'
-        )
     reviews_url = safe_url(place.reviews_uri)
     if reviews_url:
         evidence_links.append(
@@ -438,7 +463,7 @@ def render_place_card(place: Place, rank: int) -> None:
           </div>
           <div class="place-address">{escape(place.address)}</div>
           {known_for}
-          {dish_section}
+          {insight_note}
           {evidence}
           {actions}
         </article>

@@ -3,28 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from math import cos, radians
+from math import cos, isfinite, radians
 import re
 from urllib.parse import quote
 
 import requests
 
 from .errors import (
-    AuthenticationError,
     GoogleMapsError,
     GoogleServiceError,
     InvalidLocationError,
-    RateLimitError,
 )
 from .http_utils import build_retrying_session, raise_for_google_error
-from .menu_verifier import MenuVerifier
 from .models import FetchResult, Place, SearchArea, distance_meters
-from .recommendations import extract_recommended_dishes
 
 
 PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACE_DETAILS_URL = "https://places.googleapis.com/v1/places/{place_id}"
-GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 FIELD_MASK = ",".join(
     (
         "places.id",
@@ -80,6 +75,10 @@ GEOGRAPHIC_TYPES = {
 WALKABLE_RADIUS_METERS = 1_200.0
 MIN_WALKABLE_RADIUS_METERS = 400.0
 SMALL_SUBLOCALITY_MAX_RADIUS_METERS = 3_000.0
+METERS_PER_MILE = 1_609.344
+DEFAULT_SEARCH_RADIUS_MILES = 3.0
+MIN_SEARCH_RADIUS_MILES = 0.25
+MAX_SEARCH_RADIUS_MILES = 25.0
 SUBLOCALITY_TYPES = {
     "sublocality",
     "sublocality_level_1",
@@ -97,20 +96,14 @@ class GooglePlacesClient:
         self,
         api_key: str,
         *,
-        geocoding_api_key: str | None = None,
         max_pages: int | None = None,
         timeout_seconds: float = 15,
         session: requests.Session | None = None,
     ) -> None:
         self.api_key = api_key
-        self.geocoding_api_key = geocoding_api_key
         self.max_pages = max_pages
         self.timeout_seconds = timeout_seconds
         self.session = session or build_retrying_session()
-        self.menu_verifier = MenuVerifier(
-            session=self.session,
-            timeout_seconds=min(timeout_seconds, 12),
-        )
 
     def search_location(
         self,
@@ -118,14 +111,27 @@ class GooglePlacesClient:
         place_types: Iterable[str] = ("restaurant", "bar"),
         *,
         thorough: bool = False,
+        radius_miles: float | None = None,
     ) -> FetchResult:
         location = " ".join(location.split())
         if not location:
             raise ValueError("Enter a city, neighborhood, or ZIP/postal code.")
         if len(location) > 180:
             raise ValueError("The location is too long. Please use 180 characters or fewer.")
+        if radius_miles is not None:
+            if (
+                isinstance(radius_miles, bool)
+                or not isfinite(radius_miles)
+                or not MIN_SEARCH_RADIUS_MILES <= radius_miles <= MAX_SEARCH_RADIUS_MILES
+            ):
+                raise ValueError(
+                    f"Search radius must be between {MIN_SEARCH_RADIUS_MILES:g} and "
+                    f"{MAX_SEARCH_RADIUS_MILES:g} miles."
+                )
 
         search_area = self.resolve_location(location)
+        if radius_miles is not None:
+            search_area = search_area.with_radius(radius_miles * METERS_PER_MILE)
         all_places: list[Place] = []
         scanned_count = 0
         page_count = 0
@@ -169,7 +175,7 @@ class GooglePlacesClient:
         )
 
     def enrich_places(self, places: tuple[Place, ...]) -> tuple[Place, ...]:
-        """Add review-backed dish insights to already-qualified places only."""
+        """Add Google review summaries to already-qualified places only."""
 
         enriched: list[Place] = []
         for place in places:
@@ -181,7 +187,7 @@ class GooglePlacesClient:
         return tuple(enriched)
 
     def enrich_place(self, place: Place) -> Place:
-        """Load paid review/menu insights for one already-qualified place."""
+        """Load paid Google review insight for one already-qualified place."""
 
         return self._enrich_place(place)
 
@@ -189,7 +195,7 @@ class GooglePlacesClient:
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": self.api_key,
-            "X-Goog-FieldMask": "generativeSummary,reviewSummary,reviews,websiteUri",
+            "X-Goog-FieldMask": "generativeSummary,reviewSummary",
         }
         try:
             response = self.session.get(
@@ -201,32 +207,18 @@ class GooglePlacesClient:
         except requests.Timeout as exc:
             raise GoogleServiceError(f"Dish insights timed out for {place.name}.") from exc
         except requests.RequestException as exc:
-            raise GoogleServiceError(f"Could not load dish insights for {place.name}.") from exc
+            raise GoogleServiceError(f"Could not load review insights for {place.name}.") from exc
 
-        raise_for_google_error(response, request_kind=f"dish insights for {place.name}")
+        raise_for_google_error(response, request_kind=f"review insights for {place.name}")
         try:
             payload = response.json()
         except ValueError as exc:
-            raise GoogleServiceError(f"Google returned invalid dish insights for {place.name}.") from exc
+            raise GoogleServiceError(f"Google returned invalid review insights for {place.name}.") from exc
 
         generative = payload.get("generativeSummary") or {}
         review_summary_data = payload.get("reviewSummary") or {}
         overview = self._localized_text(generative.get("overview"))
         review_summary = self._localized_text(review_summary_data.get("text"))
-
-        reviews = payload.get("reviews") or []
-        review_texts = [
-            self._localized_text(review.get("text"))
-            for review in reviews
-            if isinstance(review, dict)
-        ]
-        review_texts = [text for text in review_texts if text]
-        dish_candidates = extract_recommended_dishes(review_summary, overview, review_texts)
-        website_uri = payload.get("websiteUri")
-        menu_verification = self.menu_verifier.verify(
-            website_uri if isinstance(website_uri, str) else None,
-            dish_candidates,
-        )
 
         known_for = overview
         summary_source = generative
@@ -239,14 +231,10 @@ class GooglePlacesClient:
             disclosure = self._localized_text(generative.get("disclosureText"))
 
         return place.with_insights(
-            recommended_dishes=menu_verification.dishes,
             known_for=known_for or None,
             reviews_uri=review_summary_data.get("reviewsUri") or place.reviews_uri,
             summary_disclosure=disclosure or None,
             summary_flag_uri=summary_source.get("flagContentUri"),
-            menu_uri=menu_verification.menu_url,
-            menu_checked=menu_verification.checked,
-            dish_candidates_found=bool(dish_candidates),
         )
 
     @staticmethod
@@ -257,9 +245,6 @@ class GooglePlacesClient:
 
     def resolve_location(self, location: str) -> SearchArea:
         """Resolve a town/neighborhood/postal code before searching businesses."""
-
-        if self.geocoding_api_key:
-            return self._resolve_location_with_geocoding(location)
 
         headers = {
             "Content-Type": "application/json",
@@ -297,131 +282,6 @@ class GooglePlacesClient:
                 "That location could not be resolved to a city, neighborhood, or postal code."
             )
         return self._area_from_candidate(geographic_candidates[0])
-
-    def _resolve_location_with_geocoding(self, location: str) -> SearchArea:
-        """Use the lower-priced Geocoding SKU when explicitly configured."""
-
-        try:
-            response = self.session.get(
-                GEOCODING_URL,
-                params={
-                    "address": location,
-                    "key": self.geocoding_api_key,
-                    "language": "en",
-                },
-                timeout=self.timeout_seconds,
-            )
-        except requests.Timeout as exc:
-            raise GoogleServiceError("Google Geocoding timed out while resolving the location.") from exc
-        except requests.RequestException as exc:
-            raise GoogleServiceError(
-                "Could not reach Google Geocoding while resolving the location."
-            ) from exc
-
-        raise_for_google_error(response, request_kind="location lookup")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise GoogleServiceError("Google returned an invalid location response.") from exc
-        if not isinstance(payload, dict):
-            raise GoogleServiceError("Google returned an invalid location response.")
-
-        status = str(payload.get("status") or "")
-        detail = str(payload.get("error_message") or "").strip()
-        if status == "ZERO_RESULTS":
-            raise InvalidLocationError(
-                "That location could not be resolved to a city, neighborhood, or postal code."
-            )
-        if status in {"REQUEST_DENIED", "OVER_DAILY_LIMIT"}:
-            suffix = f" Details: {detail[:300]}" if detail else ""
-            raise AuthenticationError(
-                "Google denied the Geocoding request. Check API enablement, key restrictions, "
-                f"and billing.{suffix}"
-            )
-        if status == "OVER_QUERY_LIMIT":
-            raise RateLimitError("Google Geocoding quota was exceeded. Try again later.")
-        if status != "OK":
-            raise GoogleServiceError(
-                f"Google Geocoding could not resolve the location ({status or 'unknown error'})."
-            )
-
-        results = payload.get("results") or []
-        if not isinstance(results, list):
-            raise GoogleServiceError("Google returned an invalid location response.")
-        geographic_results = [
-            result
-            for result in results
-            if isinstance(result, dict)
-            and GEOGRAPHIC_TYPES.intersection(result.get("types") or [])
-        ]
-        if not geographic_results:
-            raise InvalidLocationError(
-                "That location could not be resolved to a city, neighborhood, or postal code."
-            )
-
-        result = geographic_results[0]
-        geometry = result.get("geometry") or {}
-        if not isinstance(geometry, dict):
-            raise InvalidLocationError("Google did not return a usable boundary for that location.")
-        center = geometry.get("location") or {}
-        boundary = geometry.get("bounds") or geometry.get("viewport") or {}
-        if not isinstance(center, dict) or not isinstance(boundary, dict):
-            raise InvalidLocationError("Google did not return a usable boundary for that location.")
-        southwest = boundary.get("southwest") or {}
-        northeast = boundary.get("northeast") or {}
-        if not isinstance(southwest, dict) or not isinstance(northeast, dict):
-            raise InvalidLocationError("Google did not return a usable boundary for that location.")
-        raw_types = result.get("types") or []
-        display_name = self._geocoding_display_name(result, raw_types)
-        return self._area_from_candidate(
-            {
-                "id": result.get("place_id"),
-                "displayName": {"text": display_name},
-                "formattedAddress": result.get("formatted_address"),
-                "types": raw_types,
-                "location": {
-                    "latitude": center.get("lat"),
-                    "longitude": center.get("lng"),
-                },
-                "viewport": {
-                    "low": {
-                        "latitude": southwest.get("lat"),
-                        "longitude": southwest.get("lng"),
-                    },
-                    "high": {
-                        "latitude": northeast.get("lat"),
-                        "longitude": northeast.get("lng"),
-                    },
-                },
-            }
-        )
-
-    @staticmethod
-    def _geocoding_display_name(result: dict[str, object], raw_types: object) -> str:
-        result_types = (
-            {value for value in raw_types if isinstance(value, str)}
-            if isinstance(raw_types, list)
-            else set()
-        )
-        priority_types = (
-            "neighborhood",
-            "postal_code",
-            "locality",
-            *sorted(SUBLOCALITY_TYPES),
-        )
-        components = result.get("address_components") or []
-        if isinstance(components, list):
-            for wanted_type in priority_types:
-                if wanted_type not in result_types:
-                    continue
-                for component in components:
-                    if not isinstance(component, dict):
-                        continue
-                    if wanted_type in (component.get("types") or []):
-                        name = str(component.get("long_name") or "").strip()
-                        if name:
-                            return name
-        return str(result.get("formatted_address") or "Search area").split(",", 1)[0]
 
     @staticmethod
     def _area_from_candidate(candidate: dict[str, object]) -> SearchArea:

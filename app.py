@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 import hashlib
+import hmac
 from pathlib import Path
+import secrets
 
 from dotenv import load_dotenv
 import streamlit as st
@@ -17,8 +19,15 @@ from restaurant_finder.filters import filter_places
 from restaurant_finder.itinerary import suggest_evening_plan
 from restaurant_finder.map_tiles import GoogleMapTilesClient, MapTileSession
 from restaurant_finder.models import Place, SearchResult
-from restaurant_finder.places_client import GooglePlacesClient
-from restaurant_finder.service import find_curated_places
+from restaurant_finder.places_client import (
+    DEFAULT_SEARCH_RADIUS_MILES,
+    MAX_SEARCH_RADIUS_MILES,
+    METERS_PER_MILE,
+    MIN_SEARCH_RADIUS_MILES,
+    GooglePlacesClient,
+)
+from restaurant_finder.rate_limiter import RateLimiter, RateLimitRule
+from restaurant_finder.service import MIN_REVIEW_COUNT, find_curated_places
 from restaurant_finder.sharing import SharedCollection, decode_collection, encode_collection
 from restaurant_finder.ui import (
     build_map,
@@ -51,6 +60,19 @@ GENERIC_PLACE_TYPES = {
     "point_of_interest",
     "restaurant",
 }
+SEARCH_RATE_RULES = (
+    RateLimitRule("search-minute", 3, 60),
+    RateLimitRule("search-day", 20, 24 * 60 * 60),
+)
+THOROUGH_RATE_RULES = (
+    RateLimitRule("thorough-ten-minutes", 1, 10 * 60),
+    RateLimitRule("thorough-day", 3, 24 * 60 * 60),
+)
+INSIGHT_RATE_RULES = (
+    RateLimitRule("insights-ten-minutes", 1, 10 * 60),
+    RateLimitRule("insights-day", 3, 24 * 60 * 60),
+)
+MAX_INSIGHT_PLACES_PER_SEARCH = 10
 
 
 # Always load the .env next to this file. Streamlit is often launched from a
@@ -71,28 +93,29 @@ def cached_search(
     *,
     place_types: tuple[str, ...],
     thorough: bool,
+    minimum_review_count: int,
+    radius_miles: float,
     credential_version: str,
-    geocoding_credential_version: str,
     _api_key: str,
-    _geocoding_api_key: str | None,
     max_pages: int | None,
 ) -> SearchResult:
     # Fingerprints participate in the cache key while secrets prefixed with an
     # underscore stay out of Streamlit's cache metadata.
-    del credential_version, geocoding_credential_version
+    del credential_version
     return find_curated_places(
         location,
         api_key=_api_key,
-        geocoding_api_key=_geocoding_api_key,
         max_pages=max_pages,
         thorough=thorough,
         enrich=False,
         place_types=place_types,
+        minimum_review_count=minimum_review_count,
+        radius_miles=radius_miles,
     )
 
 
 # Details are cached by Place ID independently of area searches. Overlapping
-# neighborhoods therefore reuse the expensive review/menu enrichment request.
+# neighborhoods therefore reuse the expensive Google review-insight request.
 @st.cache_data(show_spinner=False, max_entries=1_024, ttl=timedelta(days=30))
 def cached_place_insight(
     place_id: str,
@@ -112,7 +135,7 @@ def add_cached_insights(result: SearchResult, *, api_key: str) -> SearchResult:
 
     enriched = []
     fingerprint = credential_fingerprint(api_key)
-    for place in result.places:
+    for place in result.places[:MAX_INSIGHT_PLACES_PER_SEARCH]:
         try:
             cached = cached_place_insight(
                 place.id,
@@ -125,17 +148,21 @@ def add_cached_insights(result: SearchResult, *, api_key: str) -> SearchResult:
             continue
         enriched.append(
             place.with_insights(
-                recommended_dishes=cached.recommended_dishes,
                 known_for=cached.known_for,
                 reviews_uri=cached.reviews_uri,
                 summary_disclosure=cached.summary_disclosure,
                 summary_flag_uri=cached.summary_flag_uri,
-                menu_uri=cached.menu_uri,
-                menu_checked=cached.menu_checked,
-                dish_candidates_found=cached.dish_candidates_found,
             )
         )
-    return replace(result, places=tuple(enriched))
+    enriched.extend(result.places[MAX_INSIGHT_PLACES_PER_SEARCH:])
+    warnings = result.warnings
+    if len(result.places) > MAX_INSIGHT_PLACES_PER_SEARCH:
+        warnings = (
+            *warnings,
+            f"Google review insights were limited to the first {MAX_INSIGHT_PLACES_PER_SEARCH} "
+            "places to control API usage.",
+        )
+    return replace(result, places=tuple(enriched), warnings=warnings)
 
 
 # Map Tiles tokens currently last about two weeks. Cache for slightly less.
@@ -159,6 +186,57 @@ def credential_fingerprint(api_key: str) -> str:
     """Invalidate a cache if credentials change without exposing the key."""
 
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+@st.cache_resource(show_spinner=False)
+def shared_rate_limiter() -> RateLimiter:
+    """Share abuse counters across Streamlit sessions in this app process."""
+
+    return RateLimiter()
+
+
+def rate_limit_subject(secret: str) -> str:
+    """Return a non-reversible client key without retaining a raw IP address."""
+
+    raw_identity: str | None = None
+    try:
+        raw_identity = st.context.ip_address
+    except (AttributeError, RuntimeError):
+        pass
+    if not isinstance(raw_identity, str) or not raw_identity:
+        raw_identity = st.session_state.setdefault(
+            "_anonymous_rate_limit_id",
+            secrets.token_urlsafe(18),
+        )
+    raw_identity = str(raw_identity)
+    return hmac.new(
+        secret.encode("utf-8"),
+        raw_identity.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def enforce_search_rate_limit(
+    *,
+    api_key: str,
+    thorough: bool,
+    include_insights: bool,
+) -> None:
+    rules = list(SEARCH_RATE_RULES)
+    if thorough:
+        rules.extend(THOROUGH_RATE_RULES)
+    if include_insights:
+        rules.extend(INSIGHT_RATE_RULES)
+    decision = shared_rate_limiter().consume(
+        rate_limit_subject(api_key),
+        tuple(rules),
+    )
+    if not decision.allowed:
+        st.error(
+            "Too many searches from this connection. "
+            f"Try again in about {decision.retry_after_seconds} seconds."
+        )
+        st.stop()
 
 
 def canonical_location(location: str) -> str:
@@ -208,6 +286,8 @@ def import_shared_collection() -> None:
     st.session_state["only_active_collection"] = True
     st.session_state["location_input"] = shared.location
     st.session_state["search_scope"] = scope_label(shared.place_types)
+    st.session_state["search_minimum_reviews"] = shared.minimum_review_count
+    st.session_state["search_radius_miles"] = shared.radius_miles
     st.session_state["shared_collection_notice"] = (
         f'Imported “{imported_name}”. Submit the prefilled search to load its places.'
     )
@@ -263,6 +343,8 @@ def render_collection_manager(result: SearchResult) -> tuple[str, frozenset[str]
                         location=result.location,
                         place_types=result.place_types,
                         place_ids=saved_ids,
+                        minimum_review_count=result.minimum_review_count,
+                        radius_miles=result.search_area.radius_meters / METERS_PER_MILE,
                     )
                 )
                 st.query_params["share"] = token
@@ -322,9 +404,9 @@ def render_filters(
             maximum_reviews = max(place.review_count for place in result.places)
             minimum_reviews = st.number_input(
                 "Minimum reviews",
-                min_value=200,
+                min_value=result.minimum_review_count,
                 max_value=maximum_reviews,
-                value=200,
+                value=result.minimum_review_count,
                 step=50,
                 key="minimum_reviews",
             )
@@ -468,8 +550,8 @@ def render_results(result: SearchResult, settings: Settings) -> None:
 
     if not any(place.insights_loaded for place in result.places):
         st.info(
-            "Cost-saving mode is active: ratings and the map are complete, while paid dish "
-            "insights were skipped. Enable menu-verified picks and submit again to load them "
+            "Cost-saving mode is active: ratings and the map are complete, while paid Google "
+            "review insights were skipped. Enable review insights and submit again to load them "
             "without repeating this cached area search."
         )
 
@@ -553,10 +635,7 @@ def main() -> None:
 
     st.session_state.setdefault("location_input", "Manhattan, NYC")
     with st.form("location_search", clear_on_submit=False):
-        input_column, scope_column, button_column = st.columns(
-            (4, 2, 1),
-            vertical_alignment="bottom",
-        )
+        input_column, scope_column = st.columns((4, 2))
         with input_column:
             location = st.text_input(
                 "City, neighborhood, or ZIP/postal code",
@@ -570,6 +649,31 @@ def main() -> None:
                 tuple(SEARCH_SCOPES),
                 key="search_scope",
             )
+        reviews_column, radius_column, button_column = st.columns(
+            (2, 2, 1),
+            vertical_alignment="bottom",
+        )
+        with reviews_column:
+            minimum_review_count = st.number_input(
+                "Minimum Google reviews required",
+                min_value=0,
+                max_value=100_000,
+                value=MIN_REVIEW_COUNT,
+                step=50,
+                key="search_minimum_reviews",
+                help="Places below this review count are excluded from the shortlist.",
+            )
+        with radius_column:
+            radius_miles = st.number_input(
+                "Search radius (miles)",
+                min_value=MIN_SEARCH_RADIUS_MILES,
+                max_value=MAX_SEARCH_RADIUS_MILES,
+                value=DEFAULT_SEARCH_RADIUS_MILES,
+                step=0.25,
+                format="%.2f",
+                key="search_radius_miles",
+                help="Distance is measured in a straight line from the resolved location center.",
+            )
         with button_column:
             submitted = st.form_submit_button(
                 "Find my shortlist",
@@ -580,21 +684,28 @@ def main() -> None:
             "Thorough coverage for larger areas",
             value=False,
             help=(
-                "Splits the resolved viewport into four cells and paginates restaurants and bars "
+                "Splits the selected search area into four cells and paginates restaurants and bars "
                 "inside each. This can find results hidden by Google's per-query cap, but may use "
                 "up to four times as many billable search requests."
             ),
         )
         include_insights = st.checkbox(
-            "Include menu-verified dish and drink picks",
+            "Include Google review insights",
             value=False,
             help=(
                 "Adds one Place Details Enterprise + Atmosphere request for each venue that "
-                "passes the strict filters. Results are cached per venue for reuse across areas."
+                f"passes the strict filters, capped at {MAX_INSIGHT_PLACES_PER_SEARCH} places per search. "
+                "Results are cached per venue for reuse across areas; "
+                "the server does not contact restaurant websites or menu hosts."
             ),
         )
 
     if submitted:
+        enforce_search_rate_limit(
+            api_key=settings.places_api_key,
+            thorough=thorough,
+            include_insights=include_insights,
+        )
         st.session_state.pop("latest_result", None)
         normalized_location = " ".join(location.split())
         if not normalized_location:
@@ -602,7 +713,7 @@ def main() -> None:
         else:
             try:
                 spinner_text = (
-                    f"Sweeping and verifying menus in {normalized_location}…"
+                    f"Sweeping and loading Google review insights in {normalized_location}…"
                     if include_insights
                     else f"Sweeping restaurants and bars in {normalized_location}…"
                 )
@@ -613,12 +724,10 @@ def main() -> None:
                         canonical_location(normalized_location),
                         place_types=SEARCH_SCOPES[scope],
                         thorough=thorough,
+                        minimum_review_count=int(minimum_review_count),
+                        radius_miles=float(radius_miles),
                         credential_version=credential_fingerprint(settings.places_api_key),
-                        geocoding_credential_version=credential_fingerprint(
-                            settings.geocoding_api_key or ""
-                        ),
                         _api_key=settings.places_api_key,
-                        _geocoding_api_key=settings.geocoding_api_key,
                         max_pages=settings.max_pages,
                     )
                     if include_insights:
@@ -649,7 +758,7 @@ def main() -> None:
 
     st.markdown(
         '<div class="footer"><span>THE SHORTLIST · A LITTLE MORE SELECTIVE.</span>'
-        '<span>Ratings and review insights from Google Maps. Menu verification reflects accessible online menus at search time.</span></div>',
+        '<span>Ratings and review insights from Google Maps. Server requests are restricted to Google Places and Map Tiles.</span></div>',
         unsafe_allow_html=True,
     )
 

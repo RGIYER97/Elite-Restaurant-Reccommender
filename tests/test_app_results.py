@@ -65,11 +65,14 @@ def fake_search(location, **kwargs):
         "location": location,
         "place_types": kwargs["place_types"],
         "thorough": kwargs["thorough"],
+        "minimum_review_count": kwargs["minimum_review_count"],
+        "radius_miles": kwargs["radius_miles"],
     }
     return SearchResult.create(
         location=location, places=(place,), scanned_count=1, page_count=1,
         search_area=area, thorough=kwargs["thorough"],
         place_types=kwargs["place_types"],
+        minimum_review_count=kwargs["minimum_review_count"],
     )
 
 def fake_insights(result, **kwargs):
@@ -194,7 +197,7 @@ def test_quality_cuisine_price_sort_and_open_now_controls() -> None:
     assert not rendered.exception
 
 
-def test_main_search_form_passes_scope_and_cost_toggles() -> None:
+def test_main_search_form_passes_scope_quality_radius_and_cost_toggles() -> None:
     rendered = AppTest.from_string(MAIN_APP).run(timeout=20)
     location = next(
         item
@@ -208,10 +211,20 @@ def test_main_search_form_passes_scope_and_cost_toggles() -> None:
     insights = next(
         item
         for item in rendered.checkbox
-        if item.label == "Include menu-verified dish and drink picks"
+        if item.label == "Include Google review insights"
+    )
+    review_threshold = next(
+        item
+        for item in rendered.number_input
+        if item.label == "Minimum Google reviews required"
+    )
+    radius = next(
+        item for item in rendered.number_input if item.label == "Search radius (miles)"
     )
     location.input("  Boston,   MA  ")
     scope.select("Bars only")
+    review_threshold.set_value(350)
+    radius.set_value(5.5)
     thorough.check()
     insights.check()
     rendered = click_button(rendered, "Find my shortlist")
@@ -220,9 +233,12 @@ def test_main_search_form_passes_scope_and_cost_toggles() -> None:
         "location": "boston, ma",
         "place_types": ("bar",),
         "thorough": True,
+        "minimum_review_count": 350,
+        "radius_miles": 5.5,
     }
     assert rendered.session_state["insights_requested"] is True
     assert rendered.session_state["latest_result"].location == "Boston, MA"
+    assert rendered.session_state["latest_result"].minimum_review_count == 350
     assert not rendered.exception
 
 
@@ -233,6 +249,8 @@ def test_shared_collection_prefills_without_triggering_search() -> None:
             location="Seattle, WA",
             place_types=("bar",),
             place_ids=("saved-place",),
+            minimum_review_count=425,
+            radius_miles=7.25,
         )
     )
     rendered = AppTest.from_string(MAIN_APP)
@@ -247,6 +265,14 @@ def test_shared_collection_prefills_without_triggering_search() -> None:
     scope = next(item for item in rendered.selectbox if item.label == "Looking for")
     assert location.value == "Seattle, WA"
     assert scope.value == "Bars only"
+    assert next(
+        item
+        for item in rendered.number_input
+        if item.label == "Minimum Google reviews required"
+    ).value == 425
+    assert next(
+        item for item in rendered.number_input if item.label == "Search radius (miles)"
+    ).value == 7.25
     assert rendered.session_state["collections"]["Seattle trip"] == ["saved-place"]
     assert "search_call" not in rendered.session_state.filtered_state
     assert not rendered.exception

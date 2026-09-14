@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -16,22 +17,72 @@ from .errors import (
 )
 
 
+ALLOWED_OUTBOUND_HOSTS = frozenset(
+    {
+        "places.googleapis.com",
+        "tile.googleapis.com",
+    }
+)
+
+
+class GoogleOnlySession(requests.Session):
+    """Reject server-side HTTP calls outside the approved Google APIs."""
+
+    @staticmethod
+    def _is_allowed_url(url: str) -> bool:
+        try:
+            parsed = urlsplit(url)
+            return (
+                parsed.scheme == "https"
+                and parsed.hostname is not None
+                and parsed.hostname.casefold() in ALLOWED_OUTBOUND_HOSTS
+                and not parsed.username
+            )
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _blocked() -> requests.RequestException:
+        return requests.RequestException(
+            "Blocked an outbound request outside Google Places and Map Tiles."
+        )
+
+    def request(self, method: str, url: str, *args: Any, **kwargs: Any) -> requests.Response:
+        if not self._is_allowed_url(url):
+            raise self._blocked()
+        return super().request(method, url, *args, **kwargs)
+
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        **kwargs: Any,
+    ) -> requests.Response:
+        # Session.send is called again when Requests follows a redirect, so this
+        # second check prevents an approved Google URL redirecting off-allowlist.
+        if not request.url or not self._is_allowed_url(request.url):
+            raise requests.RequestException(
+                "Blocked an outbound request outside Google Places and Map Tiles."
+            )
+        return super().send(request, **kwargs)
+
+
 def build_retrying_session() -> requests.Session:
-    """Create a session that retries transient POST and GET failures."""
+    """Create an allowlisted session with one transient-failure retry."""
 
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
+        total=1,
+        connect=1,
+        read=1,
+        status=1,
         backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
+        # A 429 is a quota response, not a reason to spend another attempt.
+        status_forcelist=(500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "POST"}),
         respect_retry_after_header=True,
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
+    session = GoogleOnlySession()
     session.mount("https://", adapter)
     return session
 

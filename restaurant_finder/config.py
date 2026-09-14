@@ -20,7 +20,6 @@ class Settings:
 
     places_api_key: str
     map_tiles_api_key: str
-    geocoding_api_key: str | None = None
     map_region: str = "US"
     map_language: str = "en-US"
     max_pages: int | None = None
@@ -29,11 +28,10 @@ class Settings:
     def from_env(cls) -> "Settings":
         places_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
         tiles_key = os.getenv("GOOGLE_MAP_TILES_API_KEY", "").strip() or places_key
-        geocoding_key = os.getenv("GOOGLE_GEOCODING_API_KEY", "").strip() or None
         region = os.getenv("MAP_REGION", "US").strip().upper()
         language = os.getenv("MAP_LANGUAGE", "en-US").strip()
 
-        raw_max_pages = os.getenv("PLACES_API_MAX_PAGES", "0").strip()
+        raw_max_pages = os.getenv("PLACES_API_MAX_PAGES", "2").strip()
         try:
             parsed_max_pages = int(raw_max_pages)
         except ValueError as exc:
@@ -49,7 +47,6 @@ class Settings:
         return cls(
             places_api_key=places_key,
             map_tiles_api_key=tiles_key,
-            geocoding_api_key=geocoding_key,
             map_region=region,
             map_language=language,
             max_pages=parsed_max_pages or None,

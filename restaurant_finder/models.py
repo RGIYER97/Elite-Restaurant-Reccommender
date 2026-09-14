@@ -352,6 +352,28 @@ class SearchArea:
             <= self.radius_meters
         )
 
+    def with_radius(self, radius_meters: float) -> "SearchArea":
+        """Return a center-based circular area with a matching search rectangle."""
+
+        if not isfinite(radius_meters) or radius_meters <= 0:
+            raise ValueError("Search radius must be a positive finite distance.")
+
+        latitude_delta = radius_meters / 111_320.0
+        longitude_scale = max(
+            111_320.0 * abs(cos(radians(self.center_latitude))),
+            1.0,
+        )
+        longitude_delta = min(radius_meters / longitude_scale, 180.0)
+        return replace(
+            self,
+            radius_meters=radius_meters,
+            low_latitude=max(-90.0, self.center_latitude - latitude_delta),
+            low_longitude=max(-180.0, self.center_longitude - longitude_delta),
+            high_latitude=min(90.0, self.center_latitude + latitude_delta),
+            high_longitude=min(180.0, self.center_longitude + longitude_delta),
+            is_walkable=False,
+        )
+
     def search_rectangles(self, thorough: bool) -> tuple[dict[str, dict[str, float]], ...]:
         """Return the full viewport or four cells for a higher-coverage sweep."""
 
@@ -397,6 +419,7 @@ class SearchResult:
     warnings: tuple[str, ...] = ()
     thorough: bool = False
     place_types: tuple[str, ...] = ("restaurant", "bar")
+    minimum_review_count: int = 200
 
     @classmethod
     def create(
@@ -410,6 +433,7 @@ class SearchResult:
         warnings: tuple[str, ...] = (),
         thorough: bool = False,
         place_types: tuple[str, ...] = ("restaurant", "bar"),
+        minimum_review_count: int = 200,
     ) -> "SearchResult":
         return cls(
             location=location,
@@ -421,4 +445,5 @@ class SearchResult:
             warnings=warnings,
             thorough=thorough,
             place_types=place_types,
+            minimum_review_count=minimum_review_count,
         )
