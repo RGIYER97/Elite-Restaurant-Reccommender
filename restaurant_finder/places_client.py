@@ -137,12 +137,13 @@ class GooglePlacesClient:
         page_count = 0
         warnings: list[str] = []
         capped_searches = 0
+        limited_searches = 0
         interrupted = False
         rectangles = search_area.search_rectangles(thorough)
         for rectangle in rectangles:
             for place_type in place_types:
                 try:
-                    found, scanned, pages, capped = self._search_type(
+                    found, scanned, pages, capped, limited = self._search_type(
                         search_area,
                         place_type,
                         rectangle=rectangle,
@@ -157,6 +158,7 @@ class GooglePlacesClient:
                 scanned_count += scanned
                 page_count += pages
                 capped_searches += int(capped)
+                limited_searches += int(limited)
             if interrupted:
                 break
 
@@ -164,6 +166,12 @@ class GooglePlacesClient:
             suffix = "." if thorough else "; enable Thorough search for better coverage."
             warnings.append(
                 f"{capped_searches} area/category searches reached Google's result cap{suffix}"
+            )
+        if limited_searches:
+            warnings.append(
+                f"{limited_searches} area/category searches stopped at the configured "
+                f"{self.max_pages}-page limit while more results were available; increase "
+                "PLACES_API_MAX_PAGES or enable Thorough coverage for denser areas."
             )
 
         return FetchResult(
@@ -376,7 +384,7 @@ class GooglePlacesClient:
         place_type: str,
         *,
         rectangle: dict[str, dict[str, float]] | None = None,
-    ) -> tuple[list[Place], int, int, bool]:
+    ) -> tuple[list[Place], int, int, bool, bool]:
         """Follow every page token returned for one strict place type."""
 
         base_body: dict[str, object] = {
@@ -404,6 +412,7 @@ class GooglePlacesClient:
         page_token: str | None = None
         seen_tokens: set[str] = set()
 
+        stopped_with_more_results = False
         while True:
             body = dict(base_body)
             if page_token:
@@ -449,8 +458,9 @@ class GooglePlacesClient:
             seen_tokens.add(next_token)
             page_token = next_token
 
-            if self.max_pages is not None and page_count >= self.max_pages:
+            if self.max_pages is not None and self.max_pages > 0 and page_count >= self.max_pages:
+                stopped_with_more_results = True
                 break
 
         hit_provider_cap = page_count >= 3 and scanned_count >= 60
-        return places, scanned_count, page_count, hit_provider_cap
+        return places, scanned_count, page_count, hit_provider_cap, stopped_with_more_results

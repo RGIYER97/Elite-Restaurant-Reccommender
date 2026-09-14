@@ -31,7 +31,7 @@ class Settings:
         region = os.getenv("MAP_REGION", "US").strip().upper()
         language = os.getenv("MAP_LANGUAGE", "en-US").strip()
 
-        raw_max_pages = os.getenv("PLACES_API_MAX_PAGES", "2").strip()
+        raw_max_pages = os.getenv("PLACES_API_MAX_PAGES", "3").strip()
         try:
             parsed_max_pages = int(raw_max_pages)
         except ValueError as exc:

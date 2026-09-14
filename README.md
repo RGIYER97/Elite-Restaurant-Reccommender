@@ -121,7 +121,8 @@ streamlit cache clear
 - **Thorough coverage** remains off by default because it can issue four times as
   many paginated restaurant/bar searches. Use it only when ordinary coverage is
   insufficient in a dense or large area.
-- The default per-category page ceiling is 2. Set `PLACES_API_MAX_PAGES=0` only
+- The default per-category page ceiling is 3 (Google's full 60-result query
+  window). Set `PLACES_API_MAX_PAGES=0` only
   when exhaustive pagination is intentionally preferred over predictable spend.
 - Configure daily API quotas and a Cloud Billing budget alert in Google Cloud.
   Budget alerts notify you but do not automatically cap spending; API quotas are
@@ -152,8 +153,10 @@ pytest -q
   and radius filters. The server never fetches their websites or menu documents.
 - Review and place summaries use the Place Details Enterprise + Atmosphere SKU.
   The UI preserves Google's reviews link, Gemini disclosure, and reporting link.
-- With `PLACES_API_MAX_PAGES=2` (the default), each area/category sweep stops after
-  two pages. Setting it to `0` follows every `nextPageToken` returned by Google.
+- With `PLACES_API_MAX_PAGES=3` (the default), each area/category sweep covers
+  Google's full 60-result query window. The UI warns when a lower configured
+  ceiling stops while another page token remains. Setting it to `0` follows
+  every `nextPageToken` returned by Google.
 - The optional **Thorough coverage** control divides the selected search area into
   four cells and searches both types in every cell. It improves discovery in
   larger/dense areas where a single query hits Google's result cap, but can use

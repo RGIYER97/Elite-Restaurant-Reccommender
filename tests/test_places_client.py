@@ -112,6 +112,22 @@ def test_client_follows_pagination_for_each_type() -> None:
     assert result.places[0].opening_periods[0].open_minute == 570
 
 
+def test_page_limit_warns_when_more_results_are_available() -> None:
+    fake_session = FakeSession(
+        [
+            FakeResponse({"places": [raw_location()]}),
+            FakeResponse({"places": [raw_place("r1")], "nextPageToken": "next"}),
+            FakeResponse({"places": [raw_place("r2")], "nextPageToken": "still-more"}),
+        ]
+    )
+    client = GooglePlacesClient("key", max_pages=2, session=fake_session)  # type: ignore[arg-type]
+
+    result = client.search_location("Manhattan", ("restaurant",))
+
+    assert result.page_count == 2
+    assert any("configured 2-page limit" in warning for warning in result.warnings)
+
+
 def test_searching_one_category_avoids_the_other_category_request() -> None:
     fake_session = FakeSession(
         [
